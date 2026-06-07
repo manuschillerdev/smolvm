@@ -132,26 +132,23 @@ fn link_libkrun() {
             }
         }
 
-        println!("cargo:rustc-link-search=native={}", bundle_path);
+        let bundle_dir = std::path::Path::new(&bundle_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(&bundle_path));
+        println!("cargo:rustc-link-search=native={}", bundle_dir.display());
+        println!(
+            "cargo:rustc-env=SMOLVM_COMPILED_LIB_DIR={}",
+            bundle_dir.display()
+        );
         link_krun();
 
-        // Set rpath to find libraries relative to executable
+        // Set rpath to find libraries relative to executable and in the configured bundle.
         #[cfg(target_os = "macos")]
         {
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/lib");
             println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../lib");
-
-            // Change the library's install_name to use @rpath and re-sign
-            let lib_path = std::path::Path::new(&bundle_path).join("libkrun.dylib");
-            if lib_path.exists() {
-                let _ = Command::new("install_name_tool")
-                    .args(["-id", "@rpath/libkrun.dylib", lib_path.to_str().unwrap()])
-                    .status();
-                // Re-sign after modification (macOS requires valid signature)
-                let _ = Command::new("codesign")
-                    .args(["--force", "--sign", "-", lib_path.to_str().unwrap()])
-                    .status();
-            }
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", bundle_dir.display());
+            patch_macos_libkrun_bundle(&bundle_dir);
         }
         #[cfg(target_os = "linux")]
         {
@@ -272,6 +269,46 @@ fn link_libkrun() {
 
     // Fallback
     link_krun();
+}
+
+#[cfg(target_os = "macos")]
+fn patch_macos_libkrun_bundle(bundle_dir: &std::path::Path) {
+    let lib_path = bundle_dir.join("libkrun.dylib");
+    if !lib_path.exists() {
+        return;
+    }
+
+    let lib_path = lib_path.to_string_lossy().into_owned();
+    let replacements = [
+        (
+            "/opt/homebrew/opt/libepoxy/lib/libepoxy.0.dylib",
+            "@loader_path/libepoxy.0.dylib",
+        ),
+        (
+            "/usr/local/opt/libepoxy/lib/libepoxy.0.dylib",
+            "@loader_path/libepoxy.0.dylib",
+        ),
+        (
+            "/opt/homebrew/opt/virglrenderer/lib/libvirglrenderer.1.dylib",
+            "@loader_path/libvirglrenderer.1.dylib",
+        ),
+        (
+            "/usr/local/opt/virglrenderer/lib/libvirglrenderer.1.dylib",
+            "@loader_path/libvirglrenderer.1.dylib",
+        ),
+    ];
+
+    let _ = Command::new("install_name_tool")
+        .args(["-id", "@rpath/libkrun.dylib", &lib_path])
+        .status();
+    for (old, new) in replacements {
+        let _ = Command::new("install_name_tool")
+            .args(["-change", old, new, &lib_path])
+            .status();
+    }
+    let _ = Command::new("codesign")
+        .args(["--force", "--sign", "-", &lib_path])
+        .status();
 }
 
 /// Build libkrun from the vendored submodule.

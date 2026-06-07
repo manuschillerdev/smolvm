@@ -83,7 +83,10 @@ fn start_vm_from_record(record: &VmRecord) -> Result<VmHandle> {
             record.host_mounts(),
             record.port_mappings(),
             record.vm_resources(),
-            LaunchFeatures::default(),
+            LaunchFeatures {
+                watch_parent: true,
+                ..Default::default()
+            },
         )
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
 

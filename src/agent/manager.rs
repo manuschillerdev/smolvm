@@ -1420,14 +1420,16 @@ impl AgentManager {
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
         // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
         let boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
-        // An in-process embedder (the Node/Python SDK) sets SMOLVM_BOOT_BINARY and
-        // owns the VM's lifetime — when that host process dies, the VM must die
-        // too, or it leaks as an orphan holding the VM's full RAM. The CLI (which
-        // detaches the VM on purpose) and `serve` (which reconnects to surviving
-        // VMs) don't set it, so they keep today's behavior. We pass the resulting
-        // flag down so the boot subprocess only arms its parent-death watchdog in
-        // the embedder case. See `cli/internal_boot::run`.
-        let watch_parent = boot_binary.is_some();
+        // Some in-process embedders own the VM's lifetime: when that host process
+        // dies, the VM should die too, or it leaks as an orphan holding the VM's
+        // full RAM. Persistent machine adapters (CLI, HTTP, and crate callers like
+        // smolcoder) detach VMs on purpose, even when they supply a helper binary
+        // through SMOLVM_BOOT_BINARY. Keep the lifetime choice on LaunchFeatures
+        // instead of inferring it from the helper path; allow the env var to
+        // override for diagnostics and compatibility.
+        let watch_parent = std::env::var_os("SMOLVM_BOOT_WATCH_PARENT")
+            .map(|value| value == std::ffi::OsStr::new("1"))
+            .unwrap_or(features.watch_parent);
         let boot_exe = boot_binary
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());

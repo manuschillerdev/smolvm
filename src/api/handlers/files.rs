@@ -9,9 +9,10 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
+use crate::api::error::ApiError;
+use crate::api::state::ApiState;
 use crate::api::TraceId;
+use crate::machine::{LocalMachineService, MachineService, ReadMachineFile, WriteMachineFile};
 
 /// Response from file upload.
 #[derive(Debug, Serialize, ToSchema)]
@@ -47,46 +48,26 @@ pub async fn upload_file(
     trace_id: Option<axum::Extension<TraceId>>,
     body: Bytes,
 ) -> Result<Json<FileUploadResponse>, ApiError> {
-    let tid = trace_id.map(|t| t.0 .0.clone());
-    let entry = state.get_machine(&id)?;
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
-
-    let machine_image = state
-        .db()
-        .get_vm(&id)
-        .map_err(ApiError::database)?
-        .and_then(|r| r.image);
-
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
     let size = body.len() as u64;
+    let request = WriteMachineFile {
+        name: id,
+        guest_path: guest_path.clone(),
+        data: body.to_vec(),
+        mode: None,
+        start_if_needed: true,
+        trace_id: trace_id.map(|t| t.0 .0.clone()),
+    };
 
-    let overlay_id = id.clone();
-    with_machine_client_traced(&entry, tid, move |c| {
-        // For image machines, mount the per-machine persistent container overlay
-        // (same id exec uses) so the file lands INSIDE the container, not the
-        // read-only agent base. Pull the image first if it isn't present yet.
-        if let Some(ref image) = machine_image {
-            if c.query(image)?.is_none() {
-                c.pull_with_registry_config(image)?;
-            }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
-        }
-        c.write_file(&guest_path, &body, None)
-    })
-    .await?;
+    let db = state.db().clone();
+    tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).write_file(request))
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(ApiError::from)?;
 
     Ok(Json(FileUploadResponse {
-        path: format!("/{}", file_path),
+        path: guest_path,
         size,
     }))
 }
@@ -113,41 +94,20 @@ pub async fn download_file(
     Path((id, file_path)): Path<(String, String)>,
     trace_id: Option<axum::Extension<TraceId>>,
 ) -> Result<Bytes, ApiError> {
-    let tid = trace_id.map(|t| t.0 .0.clone());
-    let entry = state.get_machine(&id)?;
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
-
-    let machine_image = state
-        .db()
-        .get_vm(&id)
-        .map_err(ApiError::database)?
-        .and_then(|r| r.image);
-
     let file_path = file_path.trim_start_matches('/');
-    let guest_path = format!("/{}", file_path);
+    let request = ReadMachineFile {
+        name: id,
+        guest_path: format!("/{}", file_path),
+        start_if_needed: true,
+        trace_id: trace_id.map(|t| t.0 .0.clone()),
+    };
 
-    let overlay_id = id.clone();
-    let data = with_machine_client_traced(&entry, tid, move |c| {
-        // Read from inside the container overlay for image machines (matching
-        // upload + exec), not the agent base.
-        if let Some(ref image) = machine_image {
-            if c.query(image)?.is_none() {
-                c.pull_with_registry_config(image)?;
-            }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
-        }
-        c.read_file(&guest_path)
-    })
-    .await?;
+    let db = state.db().clone();
+    let data =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).read_file(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
 
     Ok(Bytes::from(data))
 }

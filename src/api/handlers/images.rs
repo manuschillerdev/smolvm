@@ -6,13 +6,17 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::agent::PullOptions;
-use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
+use crate::api::error::ApiError;
+use crate::api::state::ApiState;
 use crate::api::types::{
-    ApiErrorResponse, ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse,
+    ApiErrorResponse, ImageInfo, ListImagesResponse, PruneImagesRequest, PruneImagesResponse,
+    PullImageRequest, PullImageResponse, StorageStatusResponse,
 };
 use crate::api::TraceId;
+use crate::machine::{
+    ListMachineImages, LocalMachineService, MachineService, PruneMachineImages, PullMachineImage,
+    StorageStatusRequest,
+};
 
 /// List images in a machine.
 #[utoipa::path(
@@ -32,18 +36,19 @@ pub async fn list_images(
     Path(machine_id): Path<String>,
     trace_id: Option<axum::Extension<TraceId>>,
 ) -> Result<Json<ListImagesResponse>, ApiError> {
-    let tid = trace_id.map(|t| t.0 .0.clone());
-    let entry = state.get_machine(&machine_id)?;
-
-    // Check if machine VM is actually alive, return empty list if not
-    {
-        let entry = entry.lock();
-        if !entry.manager.is_process_alive() {
-            return Ok(Json(ListImagesResponse { images: Vec::new() }));
-        }
-    }
-
-    let images = with_machine_client_traced(&entry, tid, |c| c.list_images()).await?;
+    let request = ListMachineImages {
+        name: machine_id,
+        start_if_needed: false,
+        stop_after_start: false,
+        empty_when_stopped: true,
+        trace_id: trace_id.map(|t| t.0 .0.clone()),
+    };
+    let db = state.db().clone();
+    let images =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).list_images(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
 
     let images = images
         .into_iter()
@@ -82,39 +87,29 @@ pub async fn pull_image(
     trace_id: Option<axum::Extension<TraceId>>,
     Json(req): Json<PullImageRequest>,
 ) -> Result<Json<PullImageResponse>, ApiError> {
-    let tid = trace_id.map(|t| t.0 .0.clone());
     if req.image.is_empty() {
         return Err(ApiError::BadRequest(
             "image reference cannot be empty".into(),
         ));
     }
 
-    let entry = state.get_machine(&machine_id)?;
+    let request = PullMachineImage {
+        name: machine_id,
+        image: req.image.clone(),
+        oci_platform: req.oci_platform.clone(),
+        proxy: req.proxy.clone(),
+        no_proxy: req.no_proxy.clone(),
+        start_if_needed: true,
+        trace_id: trace_id.map(|t| t.0 .0.clone()),
+    };
 
-    // Ensure machine is running and persist state to DB
-    ensure_running_and_persist(&state, &machine_id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
-
-    let image = req.image.clone();
-    let oci_platform = req.oci_platform.clone();
-    let proxy = req.proxy.clone();
-    let no_proxy = req.no_proxy.clone();
+    let db = state.db().clone();
     let start = std::time::Instant::now();
-    let image_info = with_machine_client_traced(&entry, tid, move |c| {
-        let mut opts = PullOptions::new().use_registry_config(true);
-        if let Some(p) = oci_platform {
-            opts = opts.oci_platform(p);
-        }
-        if let Some(p) = proxy {
-            opts = opts.proxy(p);
-        }
-        if let Some(np) = no_proxy {
-            opts = opts.no_proxy(np);
-        }
-        c.pull(&image, opts)
-    })
-    .await?;
+    let image_info =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).pull_image(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
     metrics::histogram!("smolvm_image_pull_seconds").record(start.elapsed().as_secs_f64());
 
     Ok(Json(PullImageResponse {
@@ -126,5 +121,87 @@ pub async fn pull_image(
             os: image_info.os,
             layer_count: image_info.layer_count,
         },
+    }))
+}
+
+/// Return OCI storage status for a machine.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{id}/storage",
+    tag = "Images",
+    params(
+        ("id" = String, Path, description = "Machine name")
+    ),
+    responses(
+        (status = 200, description = "Storage status", body = StorageStatusResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not running", body = ApiErrorResponse)
+    )
+)]
+pub async fn storage_status(
+    State(state): State<Arc<ApiState>>,
+    Path(machine_id): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
+) -> Result<Json<StorageStatusResponse>, ApiError> {
+    let mut request = StorageStatusRequest::new(machine_id);
+    request.start_if_needed = true;
+    request.trace_id = trace_id.map(|t| t.0 .0.clone());
+
+    let db = state.db().clone();
+    let status = tokio::task::spawn_blocking(move || {
+        LocalMachineService::with_db(db).storage_status(request)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?;
+
+    Ok(Json(StorageStatusResponse {
+        ready: status.ready,
+        total_bytes: status.total_bytes,
+        used_bytes: status.used_bytes,
+        image_count: status.image_count,
+        layer_count: status.layer_count,
+    }))
+}
+
+/// Prune image/layer storage for a machine.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{id}/images/prune",
+    tag = "Images",
+    params(
+        ("id" = String, Path, description = "Machine name")
+    ),
+    request_body = PruneImagesRequest,
+    responses(
+        (status = 200, description = "Images pruned", body = PruneImagesResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Invalid state", body = ApiErrorResponse)
+    )
+)]
+pub async fn prune_images(
+    State(state): State<Arc<ApiState>>,
+    Path(machine_id): Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
+    Json(req): Json<PruneImagesRequest>,
+) -> Result<Json<PruneImagesResponse>, ApiError> {
+    let mut request = PruneMachineImages::new(machine_id);
+    request.dry_run = req.dry_run;
+    request.all = req.all;
+    request.stop_after_start = req.stop_after_start;
+    request.trace_id = trace_id.map(|t| t.0 .0.clone());
+
+    let db = state.db().clone();
+    let result =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).prune_images(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
+
+    Ok(Json(PruneImagesResponse {
+        freed_bytes: result.freed_bytes,
+        removed_images: result.removed_images,
+        dry_run: result.dry_run,
     }))
 }

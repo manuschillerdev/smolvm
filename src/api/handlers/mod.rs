@@ -8,55 +8,11 @@ pub mod machines;
 pub mod node;
 
 use crate::api::error::ApiError;
-use crate::api::state::MachineEntry;
-use crate::secrets::ResolutionError;
 
 /// Maximum number of ad-hoc secret refs in a single API request body.
 /// Bounds the per-request resolution work and blocks trivial DOS
 /// attempts that flood `secrets: {...}` with thousands of entries.
 pub(crate) const MAX_REQ_SECRETS_PER_REQUEST: usize = 64;
-
-/// Resolve a [`MachineEntry`]'s persisted `secret_refs` under
-/// `RecordReplay` scope. In-memory access — no DB hit per request.
-///
-/// Returns the resolved `(key, value)` tuples ready to extend into an
-/// env vector. Failures map to structured [`ApiError`]s via
-/// [`classify_resolution_error`] so HTTP status codes are consistent
-/// across exec/run handlers.
-pub(crate) fn record_secret_refs_env(
-    entry: &std::sync::Arc<parking_lot::Mutex<MachineEntry>>,
-) -> Result<Vec<(String, crate::secrets::Secret)>, ApiError> {
-    let refs = {
-        let guard = entry.lock();
-        guard.secret_refs.clone()
-    };
-    if refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    crate::secrets::resolve_refs_to_env_classified(
-        &refs,
-        crate::secrets::ResolutionScope::RecordReplay,
-    )
-    .map_err(classify_resolution_error)
-}
-
-/// Map a classified [`ResolutionError`] to an [`ApiError`] per the
-/// status-code table in `docs/secrets-api-pack-plan.md` §4.3.
-///
-/// Client-fixable failures (`EnvUnset`, `FileReadFailed`,
-/// `FileTooLarge`) → 400; server-state failures (`Internal`) → 500.
-/// Body always includes the secret key and the
-/// failure class, never the raw error message (which may include the
-/// `from_file` path or `from_env` variable name).
-pub(crate) fn classify_resolution_error(e: ResolutionError) -> ApiError {
-    let ResolutionError { key, kind } = e;
-    let body = format!("secret '{}': {}", key, kind.as_str());
-    if kind.is_client_error() {
-        ApiError::BadRequest(body)
-    } else {
-        ApiError::internal(body)
-    }
-}
 
 /// Maximum length of a secret key (guest-side env var name).
 ///
@@ -128,30 +84,6 @@ pub(crate) fn validate_request_secrets(
             .map_err(|e| ApiError::BadRequest(format!("secret '{}': {}", name, e)))?;
     }
     Ok(())
-}
-
-/// Resolve request-body `req.secrets` under `Untrusted` scope. Caller
-/// must have already called [`validate_request_secrets`].
-pub(crate) fn resolve_request_secrets(
-    refs: &std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
-) -> Result<Vec<(String, crate::secrets::Secret)>, ApiError> {
-    if refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    // `Untrusted` here is defense-in-depth — validate_request_secrets
-    // has already enforced allowed source kinds and size caps.
-    // resolve_refs_to_env_classified maps failures to ResolutionError
-    // which we then map to structured ApiError via the status-code
-    // table above.
-    //
-    // Note: we deliberately pass the ref map through twice (validate
-    // then resolve) instead of doing one combined pass, so validation
-    // failures are distinguishable in the audit log from resolution
-    // failures — the first emits a `SecretRefError` trail via the
-    // handler's own logs, the second emits `secrets::audit` records
-    // with classified `error_kind`.
-    crate::secrets::resolve_refs_to_env_classified(refs, crate::secrets::ResolutionScope::Untrusted)
-        .map_err(classify_resolution_error)
 }
 
 #[cfg(test)]
@@ -260,36 +192,5 @@ mod tests {
             }
             other => panic!("expected BadRequest, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn classify_resolution_error_maps_to_status() {
-        use crate::secrets::{ResolutionError, ResolutionFailure};
-
-        let e = ResolutionError {
-            key: "MY_KEY".to_string(),
-            kind: ResolutionFailure::EnvUnset,
-        };
-        match classify_resolution_error(e) {
-            ApiError::BadRequest(body) => {
-                assert!(body.contains("MY_KEY"));
-                assert!(body.contains("env_unset"));
-            }
-            other => panic!("EnvUnset must be 4xx, got {:?}", other),
-        }
-
-        let e = ResolutionError {
-            key: "MY_KEY".to_string(),
-            kind: ResolutionFailure::Internal,
-        };
-        // Internal is a server-state issue → 5xx. We can't easily
-        // pattern-match ApiError's internal variant name, but we can
-        // verify it's not a client error.
-        let mapped = classify_resolution_error(e);
-        assert!(
-            !matches!(mapped, ApiError::BadRequest(_)),
-            "Internal must not map to 4xx: {:?}",
-            mapped
-        );
     }
 }

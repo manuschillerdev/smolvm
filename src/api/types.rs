@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 /// Map of guest-side env var names to secret refs.
 ///
@@ -74,7 +74,7 @@ pub struct PortSpec {
 }
 
 /// VM resource specification.
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceSpec {
     /// Number of vCPUs.
@@ -190,6 +190,105 @@ pub struct ExecResponse {
     pub stderr: String,
 }
 
+/// Request for a `machine run` style session.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRunRequest {
+    /// Runtime machine name. Auto-generated for foreground runs, defaults to
+    /// `default` for detached runs when omitted.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Persist the machine record and leave the VM running.
+    #[serde(default)]
+    pub detached: bool,
+    /// Allow replacing an existing record with the same name. Useful for the
+    /// implicit `default` detached machine; explicit named detached runs should
+    /// normally leave this false.
+    #[serde(default)]
+    pub allow_existing: bool,
+    /// OCI image reference. Omit for bare-VM execution.
+    #[serde(default)]
+    #[schema(example = "alpine:latest")]
+    pub image: Option<String>,
+    /// Command and arguments.
+    #[serde(default)]
+    #[schema(example = json!(["echo", "hello"]))]
+    pub command: Vec<String>,
+    /// Entrypoint from declarative configuration.
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    /// Command from declarative configuration.
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// Environment variables.
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs. Rejected unless empty: an untrusted HTTP caller
+    /// cannot read this host's env/files.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
+    /// Working directory.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Container user.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Host mounts to attach.
+    #[serde(default)]
+    pub mounts: Vec<MountSpec>,
+    /// Port mappings.
+    #[serde(default)]
+    pub ports: Vec<PortSpec>,
+    /// VM resources.
+    #[serde(default)]
+    pub resources: ResourceSpec,
+    /// Init commands to run after first boot.
+    #[serde(default)]
+    pub init: Vec<String>,
+    /// Forward host SSH agent. Rejected on the HTTP API because it would expose
+    /// server-local credentials to an untrusted caller.
+    #[serde(default)]
+    pub ssh_agent: bool,
+    /// Hostnames used for DNS filtering.
+    #[serde(default)]
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Target OCI platform for image pulls.
+    #[serde(default)]
+    pub oci_platform: Option<String>,
+    /// Proxy URL for image pulls.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// No-proxy list for image pulls.
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+    /// Execution timeout in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Response from a `machine run` style session.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineRunResponse {
+    /// Runtime machine name.
+    pub name: String,
+    /// Whether the VM was detached and left running.
+    pub detached: bool,
+    /// VMM process id for detached sessions when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i32>,
+    /// Exit code for foreground sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Foreground stdout as UTF-8 text.
+    #[serde(default)]
+    pub stdout: String,
+    /// Foreground stderr as UTF-8 text.
+    #[serde(default)]
+    pub stderr: String,
+}
+
 /// Request to run a command in an image.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -279,6 +378,79 @@ pub struct PullImageResponse {
     pub image: ImageInfo,
 }
 
+/// Request to prune image/layer storage.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneImagesRequest {
+    /// Dry-run only.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Remove all cached manifests/layers.
+    #[serde(default)]
+    pub all: bool,
+    /// Stop the machine after this operation if the service had to start it.
+    #[serde(default)]
+    pub stop_after_start: bool,
+}
+
+/// Response from image/layer pruning.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneImagesResponse {
+    /// Bytes freed, or bytes that would be freed for a dry run.
+    pub freed_bytes: u64,
+    /// Count of removed images when known.
+    pub removed_images: usize,
+    /// Whether this was a dry run.
+    pub dry_run: bool,
+}
+
+/// OCI storage status for a machine.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageStatusResponse {
+    /// Whether the storage is formatted and ready.
+    pub ready: bool,
+    /// Total size in bytes.
+    pub total_bytes: u64,
+    /// Used size in bytes.
+    pub used_bytes: u64,
+    /// Number of cached images.
+    pub image_count: usize,
+    /// Number of cached layers.
+    pub layer_count: usize,
+}
+
+/// Request to run a network diagnostic.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkTestRequest {
+    /// URL to test.
+    #[schema(example = "https://example.com")]
+    pub url: String,
+    /// Start the machine if stopped.
+    #[serde(default)]
+    pub start_if_needed: bool,
+}
+
+/// Network diagnostic response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NetworkTestResponse {
+    /// Diagnostic output.
+    #[schema(value_type = Object)]
+    pub result: serde_json::Value,
+}
+
+/// Machine data directory response.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DataDirResponse {
+    /// Machine name.
+    pub name: String,
+    /// Host path to the machine's data directory.
+    pub path: String,
+}
+
 // ============================================================================
 // Logs Types
 // ============================================================================
@@ -299,16 +471,116 @@ pub struct LogsQuery {
 }
 
 // ============================================================================
-// Delete Types
+// Machine Lifecycle Types
 // ============================================================================
+
+/// Request body for starting a machine.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StartMachineRequest {
+    /// Start as a forkable golden machine.
+    #[serde(default)]
+    pub forkable: bool,
+    /// Proxy URL used for image pulls during first start.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// No-proxy list used for image pulls during first start.
+    #[serde(default)]
+    pub no_proxy: Option<String>,
+}
+
+/// Request body for forking a running forkable golden machine.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkMachineRequest {
+    /// Name for the clone machine.
+    pub clone: String,
+    /// Optional clone port mappings. Empty remaps the golden's ports to free host ports.
+    #[serde(default)]
+    pub ports: Vec<PortSpec>,
+}
+
+/// Request body for updating a stopped machine.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMachineRequest {
+    /// Mounts to add.
+    #[serde(default)]
+    pub add_mounts: Vec<MountSpec>,
+    /// Mounts to remove, matched by source and target.
+    #[serde(default)]
+    pub remove_mounts: Vec<MountSpec>,
+    /// Port mappings to add.
+    #[serde(default)]
+    pub add_ports: Vec<PortSpec>,
+    /// Port mappings to remove.
+    #[serde(default)]
+    pub remove_ports: Vec<PortSpec>,
+    /// New vCPU count.
+    #[serde(default)]
+    pub cpus: Option<u8>,
+    /// New memory size in MiB.
+    #[serde(default, rename = "memoryMb")]
+    pub mem: Option<u32>,
+    /// Set network enabled/disabled.
+    #[serde(default)]
+    pub network: Option<bool>,
+    /// Set GPU enabled/disabled.
+    #[serde(default)]
+    pub gpu: Option<bool>,
+    /// Expand storage disk to this size in GiB.
+    #[serde(default)]
+    pub storage_gb: Option<u64>,
+    /// Expand overlay disk to this size in GiB.
+    #[serde(default)]
+    pub overlay_gb: Option<u64>,
+    /// Environment variables to add or replace.
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Environment variable keys to remove.
+    #[serde(default)]
+    pub remove_env: Vec<String>,
+    /// Set working directory.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Replace allowed CIDR policy.
+    #[serde(default)]
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Replace DNS hostname filter policy.
+    #[serde(default)]
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Enable SSH agent forwarding on future starts.
+    #[serde(default)]
+    pub ssh_agent: Option<bool>,
+}
 
 /// Query parameters for delete machine endpoint.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct DeleteQuery {
-    /// If true, force delete even if stop fails and VM is still running.
-    /// This may orphan the VM process. Default: false.
+    /// If true, force delete even if the machine is a golden with dependent clones.
     #[serde(default)]
     pub force: bool,
+}
+
+/// Query parameters for monitor SSE.
+#[derive(Debug, Default, Deserialize, IntoParams, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorQuery {
+    /// Restart policy override: "never", "always", "on-failure", or "unless-stopped".
+    #[serde(default)]
+    pub restart: Option<String>,
+    /// Health command shell snippet.
+    #[serde(default)]
+    pub health_cmd: Option<String>,
+    /// Health timeout seconds.
+    #[serde(default)]
+    pub health_timeout_secs: Option<u64>,
+    /// Check interval seconds.
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    /// Health failures before restart.
+    #[serde(default)]
+    pub health_retries: Option<u32>,
 }
 
 // ============================================================================
@@ -450,31 +722,6 @@ pub struct CreateMachineRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
-}
-
-/// Request to execute a command in a machine.
-#[derive(Debug, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MachineExecRequest {
-    /// Command and arguments.
-    #[schema(example = json!(["echo", "hello"]))]
-    pub command: Vec<String>,
-    /// Environment variables.
-    #[serde(default)]
-    pub env: Vec<EnvVar>,
-    /// Ad-hoc secret refs. Rejected unless empty (untrusted scope).
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub secrets: RequestSecretRefs,
-    /// Working directory.
-    #[serde(default)]
-    pub workdir: Option<String>,
-    /// Timeout in seconds.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-    /// Data to pipe to the command's stdin.
-    #[serde(default)]
-    pub stdin: Option<String>,
 }
 
 /// Machine status information.

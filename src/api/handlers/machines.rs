@@ -23,55 +23,47 @@
 //! Recommended: keep names short and descriptive (e.g., "dev-vm", "test-1").
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
-use std::sync::Arc;
-use std::time::Duration;
+use std::convert::Infallible;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
-use crate::agent::{vm_data_dir, AgentClient, AgentManager, HostMount};
+use crate::agent::{AgentClient, AgentManager, HostMount};
 use crate::api::error::ApiError;
-use crate::api::state::{
-    vm_resources_to_spec, ApiState, MachineEntry, MachineRegistration, ReservationGuard,
-};
+use crate::api::state::{vm_resources_to_spec, ApiState, MachineEntry};
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, DeleteResponse, EnvVar, ExecResponse,
-    ListMachinesResponse, MachineExecRequest, MachineInfo, MountInfo, MountSpec, PortSpec,
-    ResizeMachineRequest, ResourceSpec,
+    ApiErrorResponse, CreateMachineRequest, DataDirResponse, DeleteQuery, DeleteResponse, EnvVar,
+    ForkMachineRequest, ListMachinesResponse, MachineInfo, MonitorQuery, MountInfo, MountSpec,
+    NetworkTestRequest, NetworkTestResponse, PortSpec, ResizeMachineRequest, StartMachineRequest,
+    UpdateMachineRequest,
 };
-use crate::api::validate_command;
-use crate::api::TraceId;
 use crate::config::{RecordState, RestartConfig, VmRecord};
-use crate::data::disk::{Overlay, Storage};
-use crate::data::validate_vm_name;
-use crate::process::{
-    is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
-    VM_SIGTERM_TIMEOUT,
+use crate::machine::{
+    CreateMachine, DataDirMachine, DeleteMachine, ForkMachine, GetMachine, ListMachines,
+    LocalMachineService, MachineService, MachineStatus, MonitorEvent, MonitorMachine,
+    NetworkTestMachine, StartMachine, StopMachine, UpdateMachine,
 };
-use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use crate::process::{
+    is_alive, is_our_process_strict, stop_vm_process, VM_SIGKILL_TIMEOUT, VM_SIGTERM_TIMEOUT,
+};
 use crate::util::generate_machine_name;
-use crate::Error as SmolvmError;
 
-/// Re-export of the shared resolver. The CLI and API list endpoints
-/// must compute state the same way, otherwise `machine list` (CLI)
-/// and `GET /api/v1/machines` (API) can disagree about whether a VM
-/// is `Running`, `Stopped`, or `Unreachable`. Single source of truth
-/// lives in `agent::state_probe`.
-use crate::agent::state_probe::resolve_state as resolve_machine_state;
-
-/// Convert VmRecord to MachineInfo (pure mapping, no I/O).
-fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
-    let actual_state = resolve_machine_state(name, record);
-    // Clear stale PID when the process is not actually running, so clients
-    // never see state=stopped paired with a PID.
-    let pid = if actual_state == RecordState::Stopped {
+/// Convert a typed core machine status to MachineInfo (pure mapping, no I/O).
+fn machine_status_to_info(status: &MachineStatus) -> MachineInfo {
+    let record = &status.record;
+    let pid = if status.state == RecordState::Stopped {
         None
     } else {
         record.pid
     };
     MachineInfo {
-        name: name.to_string(),
-        state: actual_state.to_string(),
+        name: status.name.clone(),
+        state: status.state.to_string(),
         cpus: record.cpus,
         mem: record.mem,
         pid,
@@ -205,7 +197,6 @@ pub async fn create_machine(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<CreateMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    // Validate: registry_ref, from, and image are mutually exclusive
     let source_count = [
         req.registry_ref.is_some(),
         req.from.is_some(),
@@ -240,25 +231,14 @@ pub async fn create_machine(
         req.registry_ref = None;
     }
 
-    // Generate name if not provided, then validate. The on-disk layout uses
-    // a hash-derived directory (see `vm_data_dir`) so name length doesn't
-    // affect the socket path — only character sanity + a generous length
-    // cap are needed.
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
-    validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
-    // Validate mount paths
-    for mount_spec in &req.mounts {
-        HostMount::try_from(mount_spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    }
-
-    // If --from is set, read manifest and extract sidecar
     let (
         image,
         source_smolmachine,
         entrypoint,
         cmd,
-        env,
+        manifest_env,
         workdir,
         manifest_cpus,
         manifest_mem,
@@ -274,41 +254,26 @@ pub async fn create_machine(
         }
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
-        // Extraction happens after the agent manager creates this machine's data
-        // dir (below), so the layers land in the machine's own dir, not here.
         let canonical = path
             .canonicalize()
             .unwrap_or_else(|_| path.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let env_parsed: Vec<(String, String)> = manifest
-            .env
-            .iter()
-            .filter_map(|e| {
-                e.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect();
-        // A .smolmachine is an untrusted, portable artifact: validate its secret
-        // refs Untrusted, which rejects every source kind, so a packed
-        // from_env/from_file can't read this host's env/files at exec time.
-        // Reject rather than carry/exfil.
-        for (key, r) in &manifest.secret_refs {
-            crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::Untrusted).map_err(
-                |e| {
+        for (key, secret_ref) in &manifest.secret_refs {
+            crate::secrets::validate_ref(secret_ref, crate::secrets::ResolutionScope::Untrusted)
+                .map_err(|e| {
                     ApiError::BadRequest(format!(
                         "packed secret '{}': {} (packs may not carry secret refs)",
                         key, e
                     ))
-                },
-            )?;
+                })?;
         }
         (
             Some(manifest.image),
             Some(canonical),
             manifest.entrypoint,
             manifest.cmd,
-            env_parsed,
+            manifest.env,
             manifest.workdir,
             manifest.cpus,
             manifest.mem,
@@ -330,164 +295,81 @@ pub async fn create_machine(
         )
     };
 
-    // Use explicit API resources when provided. Otherwise, preserve packed
-    // artifact manifest defaults, or the high VM defaults for non-artifact
-    // machines. Memory is ballooned, so a generous default does not imply
-    // immediate host commitment.
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
     let (cpus, mem) = resolve_create_resources(&req, manifest_cpus, manifest_mem);
     let network = req.network || manifest_net;
-
-    // Reserve the name atomically (prevents concurrent creation)
-    let guard = ReservationGuard::new(&state, name.clone())?;
-
-    // Create manager (does not boot the VM)
-    let manager = tokio::task::spawn_blocking({
-        let name = name.clone();
-        let storage_gb = req.storage_gb;
-        let overlay_gb = req.overlay_gb;
-        move || {
-            AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
-                .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))
-        }
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
-
-    // Extract the bundle's OCI layers into this machine's own data dir (created
-    // by the manager above) rather than the shared pack cache, so every start is
-    // independent of the .smolmachine file surviving and the macOS layers volume
-    // is owned 1:1 by the machine. Extraction mounts the case-sensitive volume on
-    // macOS; detach it immediately so a created-but-unstarted machine leaves
-    // nothing mounted (invariant: the per-machine layers volume is mounted iff
-    // the VM is running). The name was reserved above, so this never clobbers
-    // another machine's layers.
-    if let Some(ref sidecar_path) = source_smolmachine {
-        let name = name.clone();
-        let sidecar_path = sidecar_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-            let path = std::path::Path::new(&sidecar_path);
-            let cache_dir = crate::agent::machine_layers_cache_dir(&name);
-            let result = (|| {
-                smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-                match std::fs::remove_dir_all(&cache_dir) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(ApiError::internal(format!(
-                            "clear packed layers cache: {}",
-                            e
-                        )));
-                    }
-                }
-                let footer = smolvm_pack::packer::read_footer_from_sidecar(path)
-                    .map_err(|e| ApiError::internal(format!("read sidecar footer: {}", e)))?;
-                smolvm_pack::extract::extract_sidecar(path, &cache_dir, &footer, false, false)
-                    .map_err(|e| ApiError::internal(format!("extract sidecar: {}", e)))
-            })();
-            // Detach the case-sensitive volume mounted during extraction so a
-            // created-but-unstarted machine leaves nothing mounted, and so the
-            // rollback below can remove the data dir cleanly (macOS; no-op on Linux).
-            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-            if let Err(e) = result {
-                // Extraction failed after the manager created the machine's data
-                // dir. guard.complete() will not run, so no DB record persists and
-                // the name is released on drop — but the on-disk dir would be left
-                // orphaned. Roll it back so a retry starts clean. Best-effort: a
-                // remove failure only leaves the orphan, never a worse state.
-                // cache_dir is <vm_data_dir>/pack, so its parent is the data dir.
-                if let Some(vm_dir) = cache_dir.parent() {
-                    let _ = std::fs::remove_dir_all(vm_dir);
-                }
-                return Err(e);
+    let restart = match req.restart {
+        Some(ref spec) => {
+            let policy = spec
+                .policy
+                .as_deref()
+                .unwrap_or("never")
+                .parse()
+                .map_err(|e: String| ApiError::BadRequest(e))?;
+            RestartConfig {
+                policy,
+                max_retries: spec.max_retries.unwrap_or(0),
+                ..Default::default()
             }
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
-    }
-
-    let resources = ResourceSpec {
-        cpus: Some(cpus),
-        memory_mb: Some(mem),
-        network: Some(network),
-        gpu: Some(req.gpu),
-        storage_gb: req.storage_gb,
-        overlay_gb: req.overlay_gb,
-        allowed_cidrs: req.allowed_cidrs.clone(),
-        network_backend: req.network_backend,
+        }
+        None => RestartConfig::default(),
     };
 
-    // Validate request-body secret refs before persisting. Untrusted
-    // scope rejects every source kind, so any non-empty `secrets` map on
-    // the API surface is refused regardless of server binding — secrets
-    // must be configured locally via the CLI.
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    let mut create = CreateMachine::new(name.clone());
+    create.image = image;
+    create.source_smolmachine = source_smolmachine;
+    create.entrypoint = entrypoint;
+    create.cmd = cmd;
+    create.cpus = cpus;
+    create.memory_mib = mem;
+    create.mounts = req
+        .mounts
+        .iter()
+        .map(HostMount::try_from)
+        .collect::<crate::Result<Vec<_>>>()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    create.ports = req
+        .ports
+        .iter()
+        .map(crate::agent::PortMapping::from)
+        .collect();
+    create.net = network;
+    create.env = manifest_env;
+    create.workdir = workdir;
+    create.storage_gb = req.storage_gb;
+    create.overlay_gb = req.overlay_gb;
+    create.allowed_cidrs = req.allowed_cidrs.clone();
+    create.network_backend = req.network_backend;
+    create.restart_policy = Some(restart.policy.clone());
+    create.restart_max_retries = Some(restart.max_retries);
+    create.restart_max_backoff_secs = Some(restart.max_backoff_secs);
+    create.gpu = req.gpu;
+    create.secret_refs = {
+        let mut refs = manifest_secret_refs;
+        refs.extend(req.secrets.clone());
+        refs
+    };
 
-    // Complete registration: persists to DB + registers in ApiState
-    let complete_result = guard.complete(MachineRegistration {
-        manager,
-        mounts: req.mounts.clone(),
-        ports: req.ports.clone(),
-        resources: resources.clone(),
-        restart: match req.restart {
-            Some(ref spec) => {
-                let policy = spec
-                    .policy
-                    .as_deref()
-                    .unwrap_or("never")
-                    .parse()
-                    .map_err(|e: String| ApiError::BadRequest(e))?;
-                RestartConfig {
-                    policy,
-                    max_retries: spec.max_retries.unwrap_or(0),
-                    ..Default::default()
-                }
-            }
-            None => RestartConfig::default(),
-        },
-        network,
-        image,
-        source_smolmachine,
-        entrypoint,
-        cmd,
-        env,
-        workdir,
-        // Record secrets = packed refs from --from (validated Untrusted above)
-        // merged with request refs (validated Untrusted at ~line 333); request
-        // refs win on key collision. Both sources are store-only, so RecordReplay
-        // resolution at exec time stays safe.
-        secret_refs: {
-            let mut s = manifest_secret_refs;
-            s.extend(req.secrets.clone());
-            s
-        },
-    });
-    if let Err(e) = complete_result {
-        let data_dir = vm_data_dir(&name);
-        smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(
-            &name,
-        ));
-        if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
-            if remove_err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    machine = %name,
-                    dir = %data_dir.display(),
-                    error = %remove_err,
-                    "failed to remove machine data dir after create commit failure"
-                );
-            }
-        }
-        return Err(e);
-    }
+    let db = state.db().clone();
+    let status =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).create(create))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
 
-    // Fetch the persisted record for the response
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::internal("machine disappeared after creation".to_string()))?;
+    let manager = tokio::task::spawn_blocking({
+        let name = name.clone();
+        let storage_gb = status.record.storage_gb;
+        let overlay_gb = status.record.overlay_gb;
+        move || AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))?;
 
-    Ok(Json(record_to_info(&name, &record)))
+    state.insert_machine(&name, machine_entry_from_record(&status.record, manager));
+
+    Ok(Json(machine_status_to_info(&status)))
 }
 
 /// List all machines.
@@ -503,13 +385,14 @@ pub async fn create_machine(
 pub async fn list_machines(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ListMachinesResponse>, ApiError> {
-    let db = state.db();
-    let vms = db.list_vms().map_err(ApiError::database)?;
+    let db = state.db().clone();
+    let statuses =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).list(ListMachines))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
 
-    let machines: Vec<MachineInfo> = vms
-        .iter()
-        .map(|(name, record)| record_to_info(name, record))
-        .collect();
+    let machines = statuses.iter().map(machine_status_to_info).collect();
 
     Ok(Json(ListMachinesResponse { machines }))
 }
@@ -531,13 +414,17 @@ pub async fn get_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let db = state.db().clone();
+    let status = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || LocalMachineService::with_db(db).status(GetMachine::new(name))
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
 
-    Ok(Json(record_to_info(&name, &record)))
+    Ok(Json(machine_status_to_info(&status)))
 }
 
 /// Start a machine.
@@ -557,136 +444,94 @@ pub async fn get_machine(
 pub async fn start_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    body: Option<Json<StartMachineRequest>>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    // Hold the per-machine lifecycle lock across the whole start so a concurrent
-    // stop/delete cannot detach the macOS layers volume between our acquire+mount
-    // and the launch, nor launch a guest into the launcher's missing-dir error
-    // (review finding #3). Acquired before the DB read and resolve_state probe
-    // below so the "is it running?" decision and the launch happen under one held
-    // lock; it is the outermost lock (the entry mutex is taken later, inside the
-    // spawn_blocking). Linux: the guarded detach/mount are no-ops.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
 
-    // Get VM record from database
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
-
-    // Resolve via the shared probe (PID + vsock ping) so we don't
-    // mistake a zombie VMM (live PID, dead agent) for Running — the
-    // CLI's `start --name` handles this same case; the API must
-    // match or a REST caller ends up with "start succeeded" followed
-    // by every subsequent /exec failing.
-    //
-    // `resolve_state` does a short vsock ping, so run it on the
-    // blocking pool rather than in the async task.
-    let name_probe = name.clone();
-    let record_probe = record.clone();
-    let resolved = tokio::task::spawn_blocking(move || {
-        crate::agent::state_probe::resolve_state(&name_probe, &record_probe)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
-
-    if resolved == RecordState::Running {
-        if !state.machine_exists(&name) {
-            // Running in DB but not in registry (startup recovery case).
-            let name_for_repair = name.clone();
-            let storage_gb = record.storage_gb;
-            let overlay_gb = record.overlay_gb;
-            let manager = tokio::task::spawn_blocking(move || {
-                AgentManager::for_vm_with_sizes(&name_for_repair, storage_gb, overlay_gb)
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-            .map_err(|e| {
-                ApiError::internal(format!(
-                    "machine '{}' is running but registry repair failed: {}",
-                    name, e
-                ))
-            })?;
-
-            state.insert_machine(&name, machine_entry_from_record(&record, manager));
+    let db = state.db().clone();
+    let start_request = body.map(|Json(body)| body).unwrap_or_default();
+    let status = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || {
+            let mut request = StartMachine::new(name);
+            request.forkable = start_request.forkable;
+            request.proxy = start_request.proxy;
+            request.no_proxy = start_request.no_proxy;
+            LocalMachineService::with_db(db).start(request)
         }
-        return Ok(Json(record_to_info(&name, &record)));
-    }
-
-    if resolved == RecordState::Unreachable {
-        // Zombie: verified-kill the VMM and clear the DB record
-        // before falling through to a clean fresh start. Any stale
-        // in-memory registry entry gets overwritten by the
-        // `insert_machine` call later in this handler.
-        let name_recover = name.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::agent::state_probe::recover_if_unreachable(&name_recover);
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
-    }
-
-    let mounts = record.host_mounts();
-    let ports = record.port_mappings();
-    let resources = record.vm_resources();
-
-    // Start agent VM in blocking task.
-    // Uses subprocess launch to avoid macOS fork-in-multithreaded-process issue.
-    let name_clone = name.clone();
-    let storage_gb = record.storage_gb;
-    let overlay_gb = record.overlay_gb;
-    let source_smolmachine = record.source_smolmachine.clone();
-    let (manager, pid) = tokio::task::spawn_blocking(move || {
-        let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
-            .map_err(|e| format!("failed to create agent manager: {}", e))?;
-
-        // Wire pre-extracted layers if this machine was created from a .smolmachine.
-        let features = crate::api::state::build_launch_features(
-            Some(&name_clone),
-            source_smolmachine.as_deref(),
-        )
-        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
-        let _ = manager
-            .ensure_running_via_subprocess(mounts, ports, resources, features)
-            .map_err(|e| format!("failed to start machine: {}", e))?;
-
-        let pid = manager.child_pid();
-        Ok::<_, String>((manager, pid))
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::from)?;
 
-    // Register in ApiState so exec/run/container endpoints can find it
-    state.insert_machine(&name, machine_entry_from_record(&record, manager));
+    let manager = tokio::task::spawn_blocking({
+        let name = name.clone();
+        let storage_gb = status.record.storage_gb;
+        let overlay_gb = status.record.overlay_gb;
+        move || AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))?;
+    state.insert_machine(&name, machine_entry_from_record(&status.record, manager));
 
-    // Capture start time for PID verification
-    let pid_start_time = pid.and_then(process_start_time);
+    Ok(Json(machine_status_to_info(&status)))
+}
 
-    // Persist state to database
-    let record = db
-        .update_vm(&name, |r| {
-            r.state = RecordState::Running;
-            r.pid = pid;
-            r.pid_start_time = pid_start_time;
-        })
-        .map_err(ApiError::database)?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "machine '{}' disappeared from database during start",
-                name
-            ))
-        })?;
+/// Fork a running forkable machine.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/fork",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Golden machine name")
+    ),
+    request_body = ForkMachineRequest,
+    responses(
+        (status = 200, description = "Machine forked", body = MachineInfo),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Clone already exists or golden not forkable", body = ApiErrorResponse)
+    )
+)]
+pub async fn fork_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<ForkMachineRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock().await;
 
-    // Build response directly with state=running. We just confirmed the VM
-    // is running (wait_for_ready passed), so we bypass actual_state() which
-    // may falsely report "stopped" on macOS due to setsid/session-leader
-    // PID visibility issues.
-    let mut info = record_to_info(&name, &record);
-    info.state = "running".to_string();
-    info.pid = pid;
-    Ok(Json(info))
+    let mut request = ForkMachine::new(name.clone(), req.clone.clone());
+    request.ports = req
+        .ports
+        .iter()
+        .map(crate::agent::PortMapping::from)
+        .collect();
+
+    let db = state.db().clone();
+    let status =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).fork(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
+
+    let manager = tokio::task::spawn_blocking({
+        let name = status.name.clone();
+        let storage_gb = status.record.storage_gb;
+        let overlay_gb = status.record.overlay_gb;
+        move || AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))?;
+    state.insert_machine(
+        &status.name,
+        machine_entry_from_record(&status.record, manager),
+    );
+
+    Ok(Json(machine_status_to_info(&status)))
 }
 
 /// Stop a machine.
@@ -707,113 +552,23 @@ pub async fn stop_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    // Hold the per-machine lifecycle lock across the whole stop so the layers
-    // volume detach below cannot race a concurrent start's acquire+mount+launch
-    // (review finding #3). Acquired before the DB read and actual_state() probe
-    // so the liveness check and the detach act on the same held lock — without
-    // it, stop could decide "running" off a snapshot a concurrent start has
-    // already superseded, then detach a volume that start just mounted. Outermost
-    // lock; the entry mutex is not taken here. Linux: detach is a no-op.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
 
-    // Get VM record from database
-    let db = state.db();
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
-
-    // Check state
-    let actual_state = record.actual_state();
-    if actual_state != RecordState::Running {
-        // Not running. If a prior start mounted the layers volume but the VM
-        // then failed to boot (or the server crashed while running), the volume
-        // could still be mounted — detach it so a stopped machine never holds a
-        // mount (invariant: the per-machine layers volume is mounted iff the VM
-        // is running). Safe: actual_state() probed liveness, so the process is
-        // confirmed dead and nothing is using the volume. macOS hdiutil detach;
-        // a no-op on Linux.
-        if record.source_smolmachine.is_some() {
-            let name_clone = name.clone();
-            tokio::task::spawn_blocking(move || {
-                smolvm_pack::extract::force_detach_layers_volume(
-                    &crate::agent::machine_layers_cache_dir(&name_clone),
-                );
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
-        }
-        return Ok(Json(record_to_info(&name, &record)));
-    }
-
-    // Get PID and start time from database record - this is the source of truth
-    let pid = record.pid;
-    let pid_start_time = record.pid_start_time;
-
-    // Stop VM — prefer using the registered manager (which holds the flock)
-    // over creating a throwaway one. This ensures the flock is released so
-    // a subsequent start can re-acquire it.
-    let entry = state.get_machine(&name).ok();
-    let name_clone = name.clone();
-    let stopped = tokio::task::spawn_blocking(move || {
-        let ok = if let Some(ref entry) = entry {
-            let e = entry.lock();
-            match e.manager.stop() {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::warn!(name = %name_clone, error = %err, "manager.stop() failed, falling back to process kill");
-                    shutdown_machine_process(&name_clone, pid, pid_start_time)
-                }
-            }
-        } else {
-            shutdown_machine_process(&name_clone, pid, pid_start_time)
-        };
-        if ok {
-            // Process is gone — detach this machine's case-sensitive layers
-            // volume (macOS hdiutil mount; no-op on Linux). The volume lives
-            // under the machine's own data dir and is owned 1:1 by it, so the
-            // detach is unconditional and re-acquired on the next start.
-            smolvm_pack::extract::force_detach_layers_volume(
-                &crate::agent::machine_layers_cache_dir(&name_clone),
-            );
-        }
-        ok
+    let db = state.db().clone();
+    let status = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || LocalMachineService::with_db(db).stop(StopMachine::new(name))
     })
     .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?;
 
-    if !stopped {
-        return Err(ApiError::Internal(format!(
-            "machine '{}' process may still be running after stop attempt",
-            name
-        )));
-    }
-
-    // The VM process is confirmed dead, but the long-lived registry manager for
-    // this machine still holds the per-VM `vm.lock` flock in this serve process.
-    // Release it so a subsequent start can re-acquire the lock; otherwise start
-    // fails with "another process is already starting or running this VM".
     if let Ok(entry) = state.get_machine(&name) {
         entry.lock().manager.mark_stopped();
     }
 
-    // Persist state to database and get updated record — only after confirmed stop
-    let record = db
-        .update_vm(&name, |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-        })
-        .map_err(ApiError::database)?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "machine '{}' disappeared from database during stop",
-                name
-            ))
-        })?;
-
-    Ok(Json(record_to_info(&name, &record)))
+    Ok(Json(machine_status_to_info(&status)))
 }
 
 /// Gracefully stop every running VM before the server exits. Opt-in via
@@ -902,159 +657,108 @@ pub async fn drain_machines(state: &Arc<ApiState>) {
 pub async fn delete_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
+    Query(query): Query<DeleteQuery>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
-    // Hold the per-machine lifecycle lock across the whole delete so the layers
-    // volume detach (before the data-dir removal) cannot race a concurrent
-    // start's acquire+mount+launch (review finding #3). Acquired before the DB
-    // read so the existence check, shutdown, detach, and removal all happen under
-    // one held lock. Outermost lock; the entry mutex is not taken here. Linux:
-    // detach is a no-op.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
 
-    let db = state.db();
-
-    // Check if VM exists and get its state
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
-
-    // Get PID and start time from database record
-    let pid = record.pid;
-    let pid_start_time = record.pid_start_time;
-
-    // Stop if running (in blocking task)
-    let name_clone = name.clone();
-    let stopped = tokio::task::spawn_blocking(move || {
-        let ok = shutdown_machine_process(&name_clone, pid, pid_start_time);
-        if ok {
-            // Process is gone — detach this machine's case-sensitive layers
-            // volume (macOS hdiutil mount; no-op on Linux) before the data dir is
-            // removed below, otherwise `rm -rf` fails with "Resource busy". The
-            // volume is owned 1:1 by this machine, so the detach is unconditional.
-            smolvm_pack::extract::force_detach_layers_volume(
-                &crate::agent::machine_layers_cache_dir(&name_clone),
-            );
+    let db = state.db().clone();
+    tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || {
+            let mut request = DeleteMachine::new(name);
+            request.break_dependent_clones = query.force;
+            LocalMachineService::with_db(db).delete(request)
         }
-        ok
     })
     .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?;
 
-    if !stopped {
-        return Err(ApiError::Internal(format!(
-            "machine '{}' process (pid {}) is still alive after shutdown; not removing",
-            name,
-            pid.map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".into()),
-        )));
-    }
-
-    // Remove from registry (in-memory + database)
-    match state.remove_machine(&name) {
-        Ok(_) => {}
-        Err(ApiError::NotFound(_)) => {
-            // Machine exists in DB but not in registry (startup recovery case).
-            // Remove directly from DB.
-            let removed = db.remove_vm(&name).map_err(ApiError::database)?;
-            if removed.is_none() {
-                return Err(ApiError::NotFound(format!("machine '{}' not found", name)));
-            }
-        }
-        Err(e) => return Err(e),
-    }
-
-    // Remove VM data directory (disk images, sockets, etc.)
-    let data_dir = vm_data_dir(&name);
-    if data_dir.exists() {
-        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
-            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
-        }
-    }
-
+    let _ = state.forget_machine(&name);
     Ok(Json(DeleteResponse { deleted: name }))
 }
 
-/// Execute a command in a machine.
+/// Update a stopped machine.
 #[utoipa::path(
-    post,
-    path = "/api/v1/machines/{name}/exec",
+    patch,
+    path = "/api/v1/machines/{name}",
     tag = "Machines",
     params(
         ("name" = String, Path, description = "Machine name")
     ),
-    request_body = MachineExecRequest,
+    request_body = UpdateMachineRequest,
     responses(
-        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 200, description = "Machine updated", body = MachineInfo),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Machine not running", body = ApiErrorResponse),
-        (status = 500, description = "Execution failed", body = ApiErrorResponse)
+        (status = 409, description = "Machine must be stopped", body = ApiErrorResponse)
     )
 )]
-pub async fn exec_machine(
+pub async fn update_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
-    trace_id: Option<axum::Extension<TraceId>>,
-    Json(req): Json<MachineExecRequest>,
-) -> Result<Json<ExecResponse>, ApiError> {
-    let tid = trace_id.map(|t| t.0 .0.clone());
-    validate_command(&req.command)?;
+    Json(req): Json<UpdateMachineRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let mut update = UpdateMachine::new(name.clone());
+    update.add_mounts = req
+        .add_mounts
+        .iter()
+        .map(HostMount::try_from)
+        .collect::<crate::Result<Vec<_>>>()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    update.remove_mounts = req
+        .remove_mounts
+        .iter()
+        .map(HostMount::try_from)
+        .collect::<crate::Result<Vec<_>>>()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    update.add_ports = req
+        .add_ports
+        .iter()
+        .map(crate::agent::PortMapping::from)
+        .collect();
+    update.remove_ports = req
+        .remove_ports
+        .iter()
+        .map(crate::agent::PortMapping::from)
+        .collect();
+    update.cpus = req.cpus;
+    update.memory_mib = req.mem;
+    match req.network {
+        Some(true) => update.enable_network = true,
+        Some(false) => update.disable_network = true,
+        None => {}
+    }
+    match req.gpu {
+        Some(true) => update.enable_gpu = true,
+        Some(false) => update.disable_gpu = true,
+        None => {}
+    }
+    update.storage_gb = req.storage_gb;
+    update.overlay_gb = req.overlay_gb;
+    update.set_env = EnvVar::to_tuples(&req.env);
+    update.remove_env = req.remove_env;
+    update.workdir = req.workdir;
+    update.allowed_cidrs = req.allowed_cidrs;
+    update.dns_filter_hosts = req.dns_filter_hosts;
+    match req.ssh_agent {
+        Some(true) => update.enable_ssh_agent = true,
+        Some(false) => update.disable_ssh_agent = true,
+        None => {}
+    }
 
-    // Load the in-memory machine entry; its `secret_refs` were
-    // populated at create time and updated via start/stop handlers.
-    // This avoids a second DB read per request.
-    let entry = state.get_machine(&name)?;
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
-
-    let name_clone = name.clone();
-    let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
-    let timeout = req.timeout_secs.map(Duration::from_secs);
-    let stdin_data = req.stdin.clone();
-
-    let result = tokio::task::spawn_blocking(move || {
-        // Get manager and check if running
-        let manager = AgentManager::for_vm(&name_clone)
-            .map_err(|e| SmolvmError::agent("create agent manager", e.to_string()))?;
-
-        if manager.try_connect_existing().is_none() {
-            return Err(SmolvmError::InvalidState {
-                expected: "running".into(),
-                actual: "stopped".into(),
-            });
-        }
-
-        // Execute command
-        let mut client = manager
-            .connect()
-            .map_err(|e| SmolvmError::agent("connect", e.to_string()))?;
-        if let Some(tid) = tid {
-            client.set_trace_id(tid);
-        }
-        let (exit_code, stdout, stderr) = client
-            .vm_exec(command, env, workdir, timeout, stdin_data)
-            .map_err(|e| SmolvmError::agent("exec", e.to_string()))?;
-
-        // Keep VM running (persistent)
-        manager.detach();
-
-        Ok(ExecResponse {
-            exit_code,
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        })
+    let db = state.db().clone();
+    let status = tokio::task::spawn_blocking(move || {
+        LocalMachineService::with_db(db)
+            .update(update)
+            .map(|result| result.status)
     })
     .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?;
 
-    result.map(Json).map_err(ApiError::from)
+    Ok(Json(machine_status_to_info(&status)))
 }
 
 /// Resize a machine's disk resources.
@@ -1079,81 +783,29 @@ pub async fn resize_machine(
     Path(name): Path<String>,
     Json(req): Json<ResizeMachineRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    let db = state.db();
-
-    let record = db
-        .get_vm(&name)
-        .map_err(ApiError::database)?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?
-        .clone();
-
-    let actual_state = record.actual_state();
-    match actual_state {
-        RecordState::Stopped | RecordState::Created => {}
-        _ => {
-            return Err(ApiError::Conflict(format!(
-                "machine '{}' must be stopped before resizing. Current state: {:?}",
-                name, actual_state
-            )));
-        }
-    }
-
-    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
-
-    if req.storage_gb.unwrap_or(current_storage_gb) < current_storage_gb {
-        return Err(ApiError::BadRequest(format!(
-            "storageGb cannot be smaller than current size ({} GiB)",
-            current_storage_gb
-        )));
-    }
-    if req.overlay_gb.unwrap_or(current_overlay_gb) < current_overlay_gb {
-        return Err(ApiError::BadRequest(format!(
-            "overlayGb cannot be smaller than current size ({} GiB)",
-            current_overlay_gb
-        )));
-    }
-
     if req.storage_gb.is_none() && req.overlay_gb.is_none() {
         return Err(ApiError::BadRequest(
             "at least one of storageGb or overlayGb must be specified".into(),
         ));
     }
 
-    let manager = AgentManager::for_vm(&name)
-        .map_err(|e| ApiError::internal(format!("failed to get agent manager: {}", e)))?;
-
-    if let Some(storage_gb) = req.storage_gb {
-        if storage_gb > current_storage_gb {
-            let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| ApiError::internal(format!("failed to expand storage: {}", e)))?;
+    let db = state.db().clone();
+    let status = tokio::task::spawn_blocking({
+        let name = name.clone();
+        move || {
+            let mut update = UpdateMachine::new(name);
+            update.storage_gb = req.storage_gb;
+            update.overlay_gb = req.overlay_gb;
+            LocalMachineService::with_db(db)
+                .update(update)
+                .map(|result| result.status)
         }
-    }
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?;
 
-    if let Some(overlay_gb) = req.overlay_gb {
-        if overlay_gb > current_overlay_gb {
-            let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| ApiError::internal(format!("failed to expand overlay: {}", e)))?;
-        }
-    }
-
-    let record = db
-        .update_vm(&name, |r| {
-            if let Some(s) = req.storage_gb {
-                r.storage_gb = Some(s);
-            }
-            if let Some(o) = req.overlay_gb {
-                r.overlay_gb = Some(o);
-            }
-        })
-        .map_err(ApiError::database)?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!("machine '{}' disappeared during resize", name))
-        })?;
-
-    Ok(Json(record_to_info(&name, &record)))
+    Ok(Json(machine_status_to_info(&status)))
 }
 
 async fn pull_from_registry(
@@ -1239,8 +891,16 @@ mod tests {
     use crate::db::SmolvmDb;
     use tempfile::TempDir;
 
+    fn info_from_record(name: &str, record: VmRecord, state: RecordState) -> MachineInfo {
+        machine_status_to_info(&MachineStatus {
+            name: name.to_string(),
+            state,
+            record,
+        })
+    }
+
     #[test]
-    fn test_record_to_info() {
+    fn test_machine_status_to_info() {
         let record = VmRecord::new(
             "test-vm".to_string(),
             2,
@@ -1253,7 +913,7 @@ mod tests {
             false,
         );
 
-        let info = record_to_info("test-vm", &record);
+        let info = info_from_record("test-vm", record, RecordState::Created);
 
         assert_eq!(info.name, "test-vm");
         assert_eq!(info.state, "created");
@@ -1266,12 +926,12 @@ mod tests {
     }
 
     #[test]
-    fn test_record_to_info_with_running_state() {
+    fn test_machine_status_to_info_with_running_state() {
         let mut record = VmRecord::new("running-vm".to_string(), 1, 512, vec![], vec![], false);
         record.state = RecordState::Running;
         record.pid = Some(12345);
 
-        let info = record_to_info("running-vm", &record);
+        let info = info_from_record("running-vm", record, RecordState::Running);
 
         assert_eq!(info.name, "running-vm");
         // Note: actual_state() checks if process is alive, which won't be true in test
@@ -1283,10 +943,10 @@ mod tests {
     }
 
     #[test]
-    fn test_record_to_info_default_values() {
+    fn test_machine_status_to_info_default_values() {
         let record = VmRecord::new("minimal-vm".to_string(), 1, 512, vec![], vec![], false);
 
-        let info = record_to_info("minimal-vm", &record);
+        let info = info_from_record("minimal-vm", record, RecordState::Created);
 
         assert_eq!(info.name, "minimal-vm");
         assert_eq!(info.state, "created");
@@ -1300,10 +960,10 @@ mod tests {
     }
 
     #[test]
-    fn test_record_to_info_with_network() {
+    fn test_machine_status_to_info_with_network() {
         let record = VmRecord::new("network-vm".to_string(), 1, 512, vec![], vec![], true);
 
-        let info = record_to_info("network-vm", &record);
+        let info = info_from_record("network-vm", record, RecordState::Created);
 
         assert_eq!(info.name, "network-vm");
         assert!(info.network);
@@ -1315,7 +975,7 @@ mod tests {
         record.network_backend = Some(crate::network::NetworkBackend::VirtioNet);
         record.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
 
-        let info = record_to_info("policy-vm", &record);
+        let info = info_from_record("policy-vm", record, RecordState::Created);
 
         assert_eq!(
             info.network_backend,
@@ -1328,7 +988,7 @@ mod tests {
 
         // Unset config stays absent so the JSON omits the fields entirely.
         let bare = VmRecord::new("bare-vm".to_string(), 1, 512, vec![], vec![], false);
-        let bare_info = record_to_info("bare-vm", &bare);
+        let bare_info = info_from_record("bare-vm", bare, RecordState::Created);
         assert!(bare_info.network_backend.is_none());
         assert!(bare_info.allowed_cidrs.is_none());
     }
@@ -1425,7 +1085,6 @@ mod tests {
     }
 
     /// Helper to create a test database and API state.
-    #[allow(dead_code)]
     fn setup_test_state() -> (TempDir, Arc<ApiState>) {
         let dir = TempDir::new().expect("failed to create temp dir");
         let db_path = dir.path().join("test.db");
@@ -1481,4 +1140,247 @@ mod tests {
         db.insert_vm(name, &record)
             .expect("failed to insert test vm");
     }
+}
+
+/// Stream monitor events for a machine as Server-Sent Events.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{name}/monitor",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name"),
+        MonitorQuery
+    ),
+    responses(
+        (status = 200, description = "Monitor event stream", content_type = "text/event-stream"),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn monitor_machine(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Query(query): Query<MonitorQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let mut request = MonitorMachine::new(name.clone());
+    request.restart_policy = query
+        .restart
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|e: String| ApiError::BadRequest(e))?;
+    request.health_cmd = query
+        .health_cmd
+        .map(|command| vec!["sh".to_string(), "-c".to_string(), command]);
+    if let Some(timeout) = query.health_timeout_secs {
+        request.health_timeout = std::time::Duration::from_secs(timeout);
+    }
+    if let Some(interval) = query.interval_secs {
+        request.interval = std::time::Duration::from_secs(interval);
+    }
+    if let Some(retries) = query.health_retries {
+        request.health_retries = retries;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = stop.clone();
+    let db = state.db().clone();
+    tokio::task::spawn_blocking(move || {
+        let service = LocalMachineService::with_db(db);
+        let mut on_event = |event| {
+            let _ = tx.send(monitor_event_to_sse(event));
+        };
+        if let Err(error) = service.monitor(request, &mut on_event, &|| {
+            stop_for_thread.load(Ordering::SeqCst)
+        }) {
+            let _ = tx.send(
+                Event::default()
+                    .event("error")
+                    .data(serde_json::json!({ "message": error.to_string() }).to_string()),
+            );
+        }
+    });
+
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let guard = StopOnDrop(stop);
+    let stream = async_stream::stream! {
+        let _guard = guard;
+        while let Some(event) = rx.recv().await {
+            yield Ok(event);
+        }
+    };
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn monitor_event_to_sse(event: MonitorEvent) -> Event {
+    match event {
+        MonitorEvent::Starting { name } => Event::default()
+            .event("starting")
+            .data(serde_json::json!({ "name": name }).to_string()),
+        MonitorEvent::Monitoring {
+            name,
+            policy,
+            interval_secs,
+            health,
+        } => Event::default().event("monitoring").data(
+            serde_json::json!({
+                "name": name,
+                "policy": policy.to_string(),
+                "intervalSecs": interval_secs,
+                "health": health.map(|h| serde_json::json!({
+                    "command": h.command,
+                    "timeoutSecs": h.timeout_secs,
+                    "retries": h.retries,
+                })),
+            })
+            .to_string(),
+        ),
+        MonitorEvent::SuspendDetected { sleep_secs } => Event::default()
+            .event("suspend")
+            .data(serde_json::json!({ "sleepSecs": sleep_secs }).to_string()),
+        MonitorEvent::HealthRecovered => Event::default()
+            .event("healthRecovered")
+            .data(serde_json::json!({}).to_string()),
+        MonitorEvent::HealthFailed {
+            exit_code,
+            consecutive,
+            retries,
+            stderr,
+        } => Event::default().event("healthFailed").data(
+            serde_json::json!({
+                "exitCode": exit_code,
+                "consecutive": consecutive,
+                "retries": retries,
+                "stderr": stderr,
+            })
+            .to_string(),
+        ),
+        MonitorEvent::HealthError {
+            consecutive,
+            retries,
+            error,
+        } => Event::default().event("healthError").data(
+            serde_json::json!({
+                "consecutive": consecutive,
+                "retries": retries,
+                "error": error,
+            })
+            .to_string(),
+        ),
+        MonitorEvent::AgentUnreachable {
+            consecutive,
+            retries,
+        } => Event::default().event("agentUnreachable").data(
+            serde_json::json!({
+                "consecutive": consecutive,
+                "retries": retries,
+            })
+            .to_string(),
+        ),
+        MonitorEvent::UnhealthyStopping => Event::default()
+            .event("unhealthyStopping")
+            .data(serde_json::json!({}).to_string()),
+        MonitorEvent::MachineExited { exit_code } => Event::default()
+            .event("machineExited")
+            .data(serde_json::json!({ "exitCode": exit_code }).to_string()),
+        MonitorEvent::Restarting {
+            attempt,
+            backoff_secs,
+        } => Event::default().event("restarting").data(
+            serde_json::json!({ "attempt": attempt, "backoffSecs": backoff_secs }).to_string(),
+        ),
+        MonitorEvent::Restarted => Event::default()
+            .event("restarted")
+            .data(serde_json::json!({}).to_string()),
+        MonitorEvent::RestartFailed { error } => Event::default()
+            .event("restartFailed")
+            .data(serde_json::json!({ "error": error }).to_string()),
+        MonitorEvent::NotRestarting {
+            policy,
+            count,
+            max_retries,
+        } => Event::default().event("notRestarting").data(
+            serde_json::json!({
+                "policy": policy.to_string(),
+                "count": count,
+                "maxRetries": max_retries,
+            })
+            .to_string(),
+        ),
+        MonitorEvent::Stopped { name } => Event::default()
+            .event("stopped")
+            .data(serde_json::json!({ "name": name }).to_string()),
+    }
+}
+
+/// Run a network connectivity diagnostic inside a machine.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/network-test",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = NetworkTestRequest,
+    responses(
+        (status = 200, description = "Network diagnostic result", body = NetworkTestResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn network_test(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    trace_id: Option<axum::Extension<crate::api::TraceId>>,
+    Json(req): Json<NetworkTestRequest>,
+) -> Result<Json<NetworkTestResponse>, ApiError> {
+    if req.url.is_empty() {
+        return Err(ApiError::BadRequest("url cannot be empty".into()));
+    }
+    let mut request = NetworkTestMachine::new(name, req.url);
+    request.start_if_needed = req.start_if_needed;
+    request.trace_id = trace_id.map(|t| t.0 .0.clone());
+    let db = state.db().clone();
+    let result =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).network_test(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
+    Ok(Json(NetworkTestResponse { result }))
+}
+
+/// Return the host data directory path for a machine.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{name}/data-dir",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    responses(
+        (status = 200, description = "Machine data directory", body = DataDirResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn data_dir(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<DataDirResponse>, ApiError> {
+    let request = DataDirMachine::new(name.clone());
+    let db = state.db().clone();
+    let path =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).data_dir(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
+    Ok(Json(DataDirResponse {
+        name,
+        path: path.to_string_lossy().into_owned(),
+    }))
 }

@@ -24,9 +24,6 @@ struct CpuSample {
 pub struct ApiState {
     /// Registry of machine managers by name.
     machines: RwLock<HashMap<String, Arc<parking_lot::Mutex<MachineEntry>>>>,
-    /// Reserved machine names (creation in progress).
-    /// This prevents race conditions during machine creation.
-    reserved_names: RwLock<HashSet<String>>,
     /// Per-machine lifecycle locks serializing start/stop/delete/restart.
     ///
     /// On macOS, stop/delete `hdiutil`-detach a machine's case-sensitive
@@ -81,99 +78,6 @@ pub struct MachineEntry {
     pub source_smolmachine: Option<String>,
 }
 
-/// Parameters for registering a new machine.
-pub struct MachineRegistration {
-    /// The agent manager for this machine.
-    pub manager: AgentManager,
-    /// Host mounts to configure.
-    pub mounts: Vec<MountSpec>,
-    /// Port mappings to configure.
-    pub ports: Vec<PortSpec>,
-    /// VM resources to configure.
-    pub resources: ResourceSpec,
-    /// Restart configuration.
-    pub restart: RestartConfig,
-    /// Whether outbound network access is enabled.
-    pub network: bool,
-    /// OCI image reference (e.g., "alpine:latest").
-    pub image: Option<String>,
-    /// Path to .smolmachine sidecar this machine was created from.
-    pub source_smolmachine: Option<String>,
-    /// Container entrypoint (from manifest).
-    pub entrypoint: Vec<String>,
-    /// Container cmd (from manifest).
-    pub cmd: Vec<String>,
-    /// Environment variables (from manifest).
-    pub env: Vec<(String, String)>,
-    /// Working directory (from manifest).
-    pub workdir: Option<String>,
-    /// Secret refs to attach to this machine (from a Smolfile or
-    /// `CreateMachineRequest.secrets`).
-    pub secret_refs: std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
-}
-
-/// RAII guard for machine name reservation.
-///
-/// Automatically releases reservation on drop unless consumed by `complete()`.
-/// This ensures reservations are always cleaned up, even on panic.
-///
-/// # Example
-///
-/// ```ignore
-/// let guard = ReservationGuard::new(&state, "my-machine".to_string())?;
-///
-/// // Create the machine manager...
-/// let manager = AgentManager::for_vm(guard.name())?;
-///
-/// // Complete registration, consuming the guard
-/// guard.complete(MachineRegistration { manager, mounts, ports, resources, restart, network })?;
-/// ```
-pub struct ReservationGuard<'a> {
-    state: &'a ApiState,
-    name: String,
-    token: String,
-    completed: bool,
-}
-
-impl<'a> ReservationGuard<'a> {
-    /// Reserve a machine name. Returns a guard that auto-releases on drop.
-    pub fn new(state: &'a ApiState, name: String) -> Result<Self, ApiError> {
-        let token = SmolvmDb::create_reservation_token();
-        state.reserve_machine_name(&name, &token)?;
-        Ok(Self {
-            state,
-            name,
-            token,
-            completed: false,
-        })
-    }
-
-    /// Get the reserved name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// Complete registration, consuming the guard without releasing.
-    ///
-    /// This transfers ownership of the name to the machine registry.
-    pub fn complete(mut self, registration: MachineRegistration) -> Result<(), ApiError> {
-        self.state
-            .complete_machine_registration(self.name.clone(), &self.token, registration)?;
-        self.completed = true;
-        Ok(())
-    }
-}
-
-impl Drop for ReservationGuard<'_> {
-    fn drop(&mut self) {
-        if !self.completed {
-            self.state
-                .release_machine_reservation(&self.name, &self.token);
-            tracing::debug!(machine = %self.name, "reservation guard released on drop");
-        }
-    }
-}
-
 impl ApiState {
     /// Create a new API state, opening the database.
     ///
@@ -187,7 +91,6 @@ impl ApiState {
         })?;
         Ok(Self {
             machines: RwLock::new(HashMap::new()),
-            reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
@@ -200,7 +103,6 @@ impl ApiState {
     pub fn with_db(db: SmolvmDb) -> Self {
         Self {
             machines: RwLock::new(HashMap::new()),
-            reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
@@ -345,6 +247,11 @@ impl ApiState {
             .entry(name.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Forget a machine from the in-memory registry without touching the database.
+    pub fn forget_machine(&self, name: &str) -> Option<Arc<parking_lot::Mutex<MachineEntry>>> {
+        self.machines.write().remove(name)
     }
 
     /// Remove a machine from the registry (also removes from database).
@@ -538,167 +445,6 @@ impl ApiState {
             total_rss_bytes / (1024 * 1024),
             total_disk_bytes / (1024 * 1024 * 1024),
         )
-    }
-
-    // ========================================================================
-    // Atomic Machine Creation (Reservation Pattern)
-    // ========================================================================
-
-    /// Reserve a machine name atomically.
-    ///
-    /// This prevents race conditions where two concurrent requests try to create
-    /// a machine with the same name. The name is reserved until either:
-    /// - `complete_machine_registration()` is called (success)
-    /// - `release_machine_reservation()` is called (failure/cleanup)
-    ///
-    /// Returns `Err(Conflict)` if the name is already taken or reserved.
-    pub fn reserve_machine_name(&self, name: &str, token: &str) -> Result<(), ApiError> {
-        // First check: machine existence (early exit for common case).
-        // Use separate scope to release read lock before acquiring write lock.
-        // This prevents lock-order inversion with complete_machine_registration.
-        {
-            let machines = self.machines.read();
-            if machines.contains_key(name) {
-                return Err(ApiError::Conflict(format!(
-                    "machine '{}' already exists",
-                    name
-                )));
-            }
-        }
-
-        // Acquire reservation lock
-        let mut reserved = self.reserved_names.write();
-
-        // Double-check machine existence (could have been added while we
-        // didn't hold the machines lock). This is necessary for correctness.
-        if self.machines.read().contains_key(name) {
-            return Err(ApiError::Conflict(format!(
-                "machine '{}' already exists",
-                name
-            )));
-        }
-
-        // Check if name is already reserved (creation in progress)
-        if reserved.contains(name) {
-            return Err(ApiError::Conflict(format!(
-                "machine '{}' is being created by another request",
-                name
-            )));
-        }
-
-        reserved.insert(name.to_string());
-
-        match self.db.reserve_vm_create(name, token) {
-            Ok(true) => {}
-            Ok(false) => {
-                reserved.remove(name);
-                return Err(ApiError::Conflict(format!(
-                    "machine '{}' already exists or is being created",
-                    name
-                )));
-            }
-            Err(e) => {
-                reserved.remove(name);
-                return Err(ApiError::database(e));
-            }
-        }
-
-        tracing::debug!(machine = %name, "reserved machine name");
-        Ok(())
-    }
-
-    /// Release a machine name reservation.
-    ///
-    /// Call this if machine creation fails after `reserve_machine_name()`.
-    pub fn release_machine_reservation(&self, name: &str, token: &str) {
-        let mut reserved = self.reserved_names.write();
-        if reserved.remove(name) {
-            tracing::debug!(machine = %name, "released machine name reservation");
-        }
-        if let Err(e) = self.db.release_vm_create_reservation(name, token) {
-            tracing::warn!(machine = %name, error = %e, "failed to release DB create reservation");
-        }
-    }
-
-    /// Complete machine registration after successful creation.
-    ///
-    /// This converts a reserved name into a fully registered machine.
-    /// The reservation is released and the machine entry is added.
-    pub fn complete_machine_registration(
-        &self,
-        name: String,
-        token: &str,
-        reg: MachineRegistration,
-    ) -> Result<(), ApiError> {
-        // Persist to database (with conflict detection)
-        let mut record = VmRecord::new_with_restart(
-            name.clone(),
-            reg.resources.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
-            reg.resources
-                .memory_mb
-                .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
-            reg.mounts
-                .iter()
-                .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
-                .collect(),
-            reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
-            reg.network,
-            reg.restart.clone(),
-        );
-        record.storage_gb = reg.resources.storage_gb;
-        record.overlay_gb = reg.resources.overlay_gb;
-        // Persist egress policy + backend selection from the request (previously
-        // dropped here, so API-created machines silently lost both).
-        record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
-        record.network_backend = reg.resources.network_backend;
-        record.image = reg.image;
-        record.source_smolmachine = reg.source_smolmachine.clone();
-        record.entrypoint = reg.entrypoint;
-        record.cmd = reg.cmd;
-        record.env = reg.env;
-        record.workdir = reg.workdir;
-        record.secret_refs = reg.secret_refs.clone();
-
-        // Complete the cross-process create reservation and insert the VM row
-        // atomically. Only after that succeeds do we publish the in-memory entry.
-        match self.db.commit_reserved_vm(&name, token, &record) {
-            Ok(true) => {
-                {
-                    let mut reserved = self.reserved_names.write();
-                    if !reserved.remove(&name) {
-                        // Name wasn't reserved - this is a programming error
-                        tracing::warn!(machine = %name, "completing registration for non-reserved name");
-                    }
-                }
-                // Successfully inserted, now add to in-memory registry
-                let mut machines = self.machines.write();
-                machines.insert(
-                    name,
-                    Arc::new(parking_lot::Mutex::new(MachineEntry {
-                        manager: reg.manager,
-                        mounts: reg.mounts,
-                        ports: reg.ports,
-                        resources: reg.resources,
-                        restart: reg.restart,
-                        network: reg.network,
-                        secret_refs: reg.secret_refs,
-                        source_smolmachine: reg.source_smolmachine,
-                    })),
-                );
-                Ok(())
-            }
-            Ok(false) => {
-                // Name already exists or the DB reservation was lost.
-                Err(ApiError::Conflict(format!(
-                    "machine '{}' already exists or is no longer reserved",
-                    name
-                )))
-            }
-            Err(e) => {
-                tracing::error!(error = %e, machine = %name, "database error during registration");
-                Err(ApiError::database(e))
-            }
-        }
     }
 
     /// Get the underlying database handle.
@@ -1190,9 +936,9 @@ mod tests {
             "dead machine DB record should be removed"
         );
 
-        // Name should be available for reuse
+        // Name should be available for reuse.
         let token = SmolvmDb::create_reservation_token();
-        assert!(state.reserve_machine_name("dead-machine", &token).is_ok());
+        assert!(state.db.reserve_vm_create("dead-machine", &token).unwrap());
     }
 
     #[test]

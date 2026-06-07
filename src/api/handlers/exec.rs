@@ -16,14 +16,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::{classify_ensure_running_error, ApiError};
-use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
+use crate::api::state::{ensure_running_and_persist, ApiState};
 use crate::api::types::{
-    ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
+    ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, MachineRunRequest,
+    MachineRunResponse, RunRequest,
 };
 use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::data::consts::BYTES_PER_MIB;
+use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::data::storage::HostMount;
+use crate::machine::{
+    ExecMachine, LocalMachineService, MachineRun, MachineRunResult, MachineService, RunMachine,
+};
+use crate::secrets::ResolutionScope;
 use tokio::sync::Semaphore;
 
 /// Execute a command in a machine.
@@ -52,134 +58,32 @@ pub async fn exec_command(
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
-
-    let entry = state.get_machine(&id)?;
-
-    // Ensure machine is running and persist state to DB
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
-
-    // Resolve secrets ONCE, before the background/foreground split, so a
-    // detached workload gets them too (a long-lived daemon usually needs its
-    // credentials more than a one-shot exec does). Env precedence (low → high):
-    // req.env (caller-plaintext) → record.secret_refs (persisted by a
-    // TrustedLocal actor) → req.secrets (ad-hoc, Untrusted). Validation runs
-    // before resolution so structural/scope violations surface as 400 without
-    // the resolution audit firing.
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
 
-    // Detached/background: spawn the process and return its PID immediately, so a
-    // long-lived daemon (dev server, agent runner) keeps running after the
-    // request returns. Image machines run it in their container (persistent
-    // overlay); plain machines run it in the VM.
-    if req.background {
-        let command = req.command.clone();
-        let workdir = req.workdir.clone();
-        let machine_image = state
-            .db()
-            .get_vm(&id)
-            .map_err(ApiError::database)?
-            .and_then(|r| r.image);
-        let pid = if let Some(image) = machine_image {
-            let mounts_config = {
-                let e = entry.lock();
-                e.mounts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
-                    .collect::<Vec<_>>()
-            };
-            let overlay_id = id.clone();
-            with_machine_client_traced(&entry, tid, move |c| {
-                if c.query(&image)?.is_none() {
-                    c.pull_with_registry_config(&image)?;
-                }
-                let config = crate::agent::RunConfig::new(image, command)
-                    .with_env(env)
-                    .with_workdir(workdir)
-                    .with_mounts(mounts_config)
-                    .with_persistent_overlay(Some(overlay_id));
-                c.run_background(config)
-            })
-            .await?
-        } else {
-            with_machine_client_traced(&entry, tid, move |c| {
-                c.vm_exec_background(command, env, workdir)
-            })
-            .await?
-        };
-        return Ok(Json(ExecResponse {
-            exit_code: 0,
-            stdout: format!("pid={pid}\n"),
-            stderr: String::new(),
-        }));
-    }
+    let mut request = ExecMachine::new(id, req.command.clone());
+    request.env = EnvVar::to_tuples(&req.env);
+    request.secret_refs = req.secrets.clone();
+    request.secret_scope = ResolutionScope::Untrusted;
+    request.workdir = req.workdir.clone();
+    request.timeout = req.timeout_secs.map(Duration::from_secs);
+    request.stdin = req.stdin.clone();
+    request.background = req.background;
+    request.start_if_needed = true;
+    request.trace_id = tid;
 
-    // Secrets already resolved into `env` above (shared with the background
-    // path); env precedence is req.env < record.secret_refs < req.secrets.
-    let command = req.command.clone();
-    let workdir = req.workdir.clone();
-    let timeout = req.timeout_secs.map(Duration::from_secs);
-    let stdin_data = req.stdin.clone();
-
-    // Image-based machines exec INSIDE a container from their image, with a
-    // per-machine persistent overlay so filesystem changes persist across exec
-    // sessions. Without this, exec runs in the bare agent VM (no `python3`,
-    // etc.) — the image is never entered. Plain machines exec in the VM
-    // directly via `vm_exec`.
-    let machine_image = state
-        .db()
-        .get_vm(&id)
-        .map_err(ApiError::database)?
-        .and_then(|r| r.image);
-
+    let db = state.db().clone();
     let start = std::time::Instant::now();
-    let (exit_code, stdout, stderr) = if let Some(image) = machine_image {
-        let mounts_config = {
-            let e = entry.lock();
-            e.mounts
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
-                .collect::<Vec<_>>()
-        };
-        let overlay_id = id.clone();
-        let stdin_data = stdin_data.clone();
-        with_machine_client_traced(&entry, tid, move |c| {
-            // Pull only if the image isn't already present — avoids a registry
-            // round-trip on every exec, and works once cached even on
-            // network-restricted machines.
-            if c.query(&image)?.is_none() {
-                c.pull_with_registry_config(&image)?;
-            }
-            let config = crate::agent::RunConfig::new(image, command)
-                .with_env(env)
-                .with_workdir(workdir)
-                .with_mounts(mounts_config)
-                .with_timeout(timeout)
-                .with_persistent_overlay(Some(overlay_id))
-                .with_stdin(stdin_data);
-            c.run_non_interactive(config)
-        })
-        .await?
-    } else {
-        with_machine_client_traced(&entry, tid, move |c| {
-            c.vm_exec(command, env, workdir, timeout, stdin_data)
-        })
-        .await?
-    };
+    let result =
+        tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).exec(request))
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+            .map_err(ApiError::from)?;
     metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
 
     Ok(Json(ExecResponse {
-        exit_code,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code: result.exit_code,
+        stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
     }))
 }
 
@@ -209,69 +113,30 @@ pub async fn exec_stream(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
-
-    let entry = state.get_machine(&id)?;
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
-
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 
-    let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
-    let timeout = req.timeout_secs.map(Duration::from_secs);
+    let mut request = ExecMachine::new(id, req.command.clone());
+    request.env = EnvVar::to_tuples(&req.env);
+    request.secret_refs = req.secrets.clone();
+    request.secret_scope = ResolutionScope::Untrusted;
+    request.workdir = req.workdir.clone();
+    request.timeout = req.timeout_secs.map(Duration::from_secs);
+    request.start_if_needed = true;
+    request.trace_id = tid;
 
-    // Image-based machines stream from a container in their image (persistent
-    // overlay keyed by machine name); plain machines stream from the VM
-    // directly. Without this, streaming exec on an image machine produces no
-    // output (the agent-base streaming path doesn't enter the container).
-    let machine_image = state
-        .db()
-        .get_vm(&id)
-        .map_err(ApiError::database)?
-        .and_then(|r| r.image);
-
-    // Run streaming exec via the machine client (vsock is synchronous)
+    let db = state.db().clone();
     let start = std::time::Instant::now();
-    let events = if let Some(image) = machine_image {
-        let mounts_config = {
-            let e = entry.lock();
-            e.mounts
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (HostMount::mount_tag(i), m.target.clone(), m.readonly))
-                .collect::<Vec<_>>()
-        };
-        let overlay_id = id.clone();
-        with_machine_client_traced(&entry, tid, move |c| {
-            if c.query(&image)?.is_none() {
-                c.pull_with_registry_config(&image)?;
-            }
-            let config = crate::agent::RunConfig::new(image, command)
-                .with_env(env)
-                .with_workdir(workdir)
-                .with_mounts(mounts_config)
-                .with_timeout(timeout)
-                .with_persistent_overlay(Some(overlay_id));
-            let mut evs = Vec::new();
-            c.run_streaming_with(config, |e| evs.push(e))?;
-            Ok(evs)
-        })
-        .await?
-    } else {
-        with_machine_client_traced(&entry, tid, move |c| {
-            c.vm_exec_streaming(command, env, workdir, timeout)
-        })
-        .await?
-    };
+    let events = tokio::task::spawn_blocking(move || {
+        let service = LocalMachineService::with_db(db);
+        let mut events = Vec::new();
+        service.exec_stream(request, &mut |event| events.push(event))?;
+        Ok::<_, crate::Error>(events)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?;
     metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
 
-    // Convert events to SSE stream
     let stream = futures_util::stream::iter(events.into_iter().map(|event| {
         let sse_event = match event {
             crate::agent::ExecEvent::Stdout(data) => Event::default()
@@ -319,57 +184,149 @@ pub async fn run_command(
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
-
-    let entry = state.get_machine(&id)?;
-
-    // Ensure machine is running and persist state to DB
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
-
     crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
 
-    let image = req.image.clone();
-    let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
-    let timeout = req.timeout_secs.map(Duration::from_secs);
+    let mut request = RunMachine::new(id, req.image.clone(), req.command.clone());
+    request.env = EnvVar::to_tuples(&req.env);
+    request.secret_refs = req.secrets.clone();
+    request.secret_scope = ResolutionScope::Untrusted;
+    request.workdir = req.workdir.clone();
+    request.timeout = req.timeout_secs.map(Duration::from_secs);
+    request.start_if_needed = true;
+    request.trace_id = tid;
 
-    // Get mounts from machine config (converted to protocol format)
-    let mounts_config = {
-        let entry = entry.lock();
-        entry
-            .mounts
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let tag = HostMount::mount_tag(i);
-                (tag, m.target.clone(), m.readonly)
-            })
-            .collect::<Vec<_>>()
-    };
-
+    let db = state.db().clone();
     let start = std::time::Instant::now();
-    let (exit_code, stdout, stderr) = with_machine_client_traced(&entry, tid, move |c| {
-        let config = crate::agent::RunConfig::new(image, command)
-            .with_env(env)
-            .with_workdir(workdir)
-            .with_mounts(mounts_config)
-            .with_timeout(timeout);
-        c.run_non_interactive(config)
-    })
-    .await?;
+    let result = tokio::task::spawn_blocking(move || LocalMachineService::with_db(db).run(request))
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+        .map_err(ApiError::from)?;
     metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
 
     Ok(Json(ExecResponse {
-        exit_code,
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code: result.exit_code,
+        stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
     }))
+}
+
+/// Run a foreground or detached `machine run` style session.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/run",
+    tag = "Execution",
+    request_body = MachineRunRequest,
+    responses(
+        (status = 200, description = "Machine run completed or detached", body = MachineRunResponse),
+        (status = 400, description = "Invalid request", body = ApiErrorResponse),
+        (status = 500, description = "Run failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn run_session(
+    State(state): State<Arc<ApiState>>,
+    _trace_id: Option<axum::Extension<TraceId>>,
+    Json(req): Json<MachineRunRequest>,
+) -> Result<Json<MachineRunResponse>, ApiError> {
+    crate::api::handlers::validate_request_secrets(&req.secrets)?;
+    if req.ssh_agent {
+        return Err(ApiError::BadRequest(
+            "sshAgent is not accepted on the HTTP API; configure SSH agent forwarding locally"
+                .into(),
+        ));
+    }
+    if !req.detached && req.command.is_empty() && req.entrypoint.is_empty() && req.cmd.is_empty() {
+        return Err(ApiError::BadRequest(
+            "foreground run requires command, entrypoint, or cmd".into(),
+        ));
+    }
+
+    let name = req.name.clone().unwrap_or_else(|| {
+        if req.detached {
+            "default".to_string()
+        } else {
+            crate::util::generate_machine_name()
+        }
+    });
+    let resources = crate::agent::VmResources {
+        cpus: req.resources.cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
+        memory_mib: req
+            .resources
+            .memory_mb
+            .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
+        network: req.resources.network.unwrap_or(false),
+        network_backend: None,
+        gpu: req.resources.gpu.unwrap_or(false),
+        gpu_vram_mib: None,
+        storage_gib: req.resources.storage_gb,
+        overlay_gib: req.resources.overlay_gb,
+        allowed_cidrs: req.resources.allowed_cidrs.clone(),
+    };
+    let mounts = req
+        .mounts
+        .iter()
+        .map(HostMount::try_from)
+        .collect::<crate::Result<Vec<_>>>()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let ports = req
+        .ports
+        .iter()
+        .map(crate::agent::PortMapping::from)
+        .collect();
+
+    let mut request = MachineRun::new(name.clone());
+    request.detached = req.detached;
+    request.allow_existing_record = req.allow_existing;
+    request.image = req.image.clone();
+    request.command = req.command.clone();
+    request.entrypoint = req.entrypoint.clone();
+    request.cmd = req.cmd.clone();
+    request.env = EnvVar::to_tuples(&req.env);
+    request.secret_refs = req.secrets.clone();
+    request.secret_scope = ResolutionScope::Untrusted;
+    request.workdir = req.workdir.clone();
+    request.user = req.user.clone();
+    request.mounts = mounts;
+    request.ports = ports;
+    request.resources = resources;
+    request.init = req.init.clone();
+    request.ssh_agent = false;
+    request.dns_filter_hosts = req.dns_filter_hosts.clone();
+    request.oci_platform = req.oci_platform.clone();
+    request.proxy = req.proxy.clone();
+    request.no_proxy = req.no_proxy.clone();
+    request.timeout = req.timeout_secs.map(Duration::from_secs);
+
+    let db = state.db().clone();
+    let result = tokio::task::spawn_blocking(move || {
+        LocalMachineService::with_db(db).run_session(request, &mut ())
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+    .map_err(ApiError::from)?;
+
+    let response = match result {
+        MachineRunResult::Detached { name, pid } => MachineRunResponse {
+            name,
+            detached: true,
+            pid,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+        MachineRunResult::Foreground {
+            exit_code,
+            stdout,
+            stderr,
+        } => MachineRunResponse {
+            name,
+            detached: false,
+            pid: None,
+            exit_code: Some(exit_code),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        },
+    };
+    Ok(Json(response))
 }
 
 /// Query parameters for an interactive PTY session.

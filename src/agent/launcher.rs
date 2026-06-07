@@ -168,6 +168,8 @@ pub struct LaunchFeatures {
     pub control_socket: Option<std::path::PathBuf>,
     /// Snapshot directory to restore from when booting a fork clone.
     pub snapshot_dir: Option<std::path::PathBuf>,
+    /// Exit the boot subprocess when its parent process dies.
+    pub watch_parent: bool,
 }
 
 impl LaunchFeatures {

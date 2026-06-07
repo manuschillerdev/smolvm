@@ -69,6 +69,13 @@ pub fn find_lib_dir() -> Option<PathBuf> {
         );
     }
 
+    if let Some(compiled_dir) = option_env!("SMOLVM_COMPILED_LIB_DIR") {
+        let path = PathBuf::from(compiled_dir);
+        if lib_names.iter().all(|lib| path.join(lib).exists()) {
+            return path.canonicalize().ok().or(Some(path));
+        }
+    }
+
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
 

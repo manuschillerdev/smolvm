@@ -80,21 +80,26 @@ pub fn cidrs_all_loopback(cidrs: &[String]) -> bool {
     })
 }
 
-/// Ensure the default DNS server is reachable in a CIDR allowlist.
+/// Ensure the given DNS server is reachable in a CIDR allowlist.
 ///
-/// If none of the existing CIDRs cover the DNS IP, appends it as /32.
+/// If none of the existing CIDRs cover the DNS IP, appends it as `/32` for
+/// IPv4 or `/128` for IPv6.
 ///
 /// Skipped when all CIDRs are loopback ranges — a loopback-only policy
 /// intentionally blocks all external traffic, so auto-adding the DNS server
 /// would violate the user's intent (e.g. `--outbound-localhost-only`).
-pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
+pub fn ensure_dns_addr_in_cidrs(cidrs: &mut Vec<String>, dns: IpAddr) {
     if cidrs_all_loopback(cidrs) {
         return;
     }
-    let dns = host_dns();
     if !cidrs_contain_ip(cidrs, &dns.to_string()) {
         cidrs.push(IpNet::from(dns).to_string());
     }
+}
+
+/// Ensure the default DNS server is reachable in a CIDR allowlist.
+pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
+    ensure_dns_addr_in_cidrs(cidrs, host_dns());
 }
 
 impl PortMapping {
@@ -189,42 +194,35 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_adds_when_missing() {
-        let dns_cidr = IpNet::from(host_dns()).to_string();
+        let dns = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let dns_cidr = IpNet::from(dns).to_string();
         let mut cidrs = vec!["10.0.0.0/8".to_string()];
-        ensure_dns_in_cidrs(&mut cidrs);
+        ensure_dns_addr_in_cidrs(&mut cidrs, dns);
         assert_eq!(cidrs.len(), 2);
         assert!(cidrs.contains(&dns_cidr));
     }
 
     #[test]
     fn test_ensure_dns_skips_when_covered_by_subnet() {
-        // Build a subnet that actually covers the detected DNS server.
-        let dns = host_dns();
-        let covering_cidr = match dns {
-            IpAddr::V4(v4) => format!("{}.0.0.0/8", v4.octets()[0]),
-            IpAddr::V6(v6) => {
-                // Use a /16 covering the detected IPv6 address.
-                let segs = v6.segments();
-                format!("{:x}::/16", segs[0])
-            }
-        };
-        let mut cidrs = vec![covering_cidr];
-        ensure_dns_in_cidrs(&mut cidrs);
+        let dns = IpAddr::V4(Ipv4Addr::new(10, 5, 3, 1));
+        let mut cidrs = vec!["10.0.0.0/8".to_string()];
+        ensure_dns_addr_in_cidrs(&mut cidrs, dns);
         assert_eq!(cidrs.len(), 1);
     }
 
     #[test]
     fn test_ensure_dns_skips_when_exact_match() {
-        let dns_cidr = IpNet::from(host_dns()).to_string();
+        let dns = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let dns_cidr = IpNet::from(dns).to_string();
         let mut cidrs = vec!["10.0.0.0/8".to_string(), dns_cidr];
-        ensure_dns_in_cidrs(&mut cidrs);
+        ensure_dns_addr_in_cidrs(&mut cidrs, dns);
         assert_eq!(cidrs.len(), 2);
     }
 
     #[test]
     fn test_ensure_dns_skips_for_loopback_only_policy() {
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "::1/128".to_string()];
-        ensure_dns_in_cidrs(&mut cidrs);
+        ensure_dns_addr_in_cidrs(&mut cidrs, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
         assert_eq!(
             cidrs.len(),
             2,
@@ -234,9 +232,10 @@ mod tests {
 
     #[test]
     fn test_ensure_dns_adds_when_non_loopback_cidr_present() {
-        let dns_cidr = IpNet::from(host_dns()).to_string();
+        let dns = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let dns_cidr = IpNet::from(dns).to_string();
         let mut cidrs = vec!["127.0.0.0/8".to_string(), "10.0.0.0/8".to_string()];
-        ensure_dns_in_cidrs(&mut cidrs);
+        ensure_dns_addr_in_cidrs(&mut cidrs, dns);
         assert_eq!(cidrs.len(), 3);
         assert!(cidrs.contains(&dns_cidr));
     }

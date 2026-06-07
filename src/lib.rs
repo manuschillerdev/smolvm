@@ -73,6 +73,8 @@ pub mod dns_filter_listener;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
 pub mod log_rotation;
+/// High-level persistent machine lifecycle API.
+pub mod machine;
 pub mod network;
 pub mod platform;
 pub mod process;

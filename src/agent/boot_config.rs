@@ -55,4 +55,10 @@ pub struct BootConfig {
     /// Additional disk images to attach (path, read_only).
     #[serde(default)]
     pub extra_disks: Vec<(PathBuf, bool)>,
+    /// Control socket for checkpoint/restore/fork operations.
+    #[serde(default)]
+    pub control_socket: Option<PathBuf>,
+    /// Snapshot directory to restore from when booting a fork clone.
+    #[serde(default)]
+    pub snapshot_dir: Option<PathBuf>,
 }

@@ -1395,6 +1395,8 @@ impl AgentManager {
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
             extra_disks: features.extra_disks,
+            control_socket: features.control_socket,
+            snapshot_dir: features.snapshot_dir,
         };
         let config_path = self
             .storage_disk
@@ -1451,8 +1453,8 @@ impl AgentManager {
             // Own process group (pgid = child pid) so the VM is immune to
             // SIGHUP from the parent's terminal closing, without making it a
             // session leader. Session-leader status causes proc_pidinfo to
-            // return a zeroed struct on macOS, breaking start-time verification
-            // in _cleanup-ephemeral and leaving orphan VM processes running.
+            // return a zeroed struct on macOS, which breaks PID start-time
+            // verification used by process cleanup code.
             .process_group(0)
             .spawn()
             .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;

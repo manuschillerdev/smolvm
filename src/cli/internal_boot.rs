@@ -345,6 +345,8 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         dns_filter_socket: dns_filter_socket_path.as_deref(),
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         extra_disks: &config.extra_disks,
+        control_socket: config.control_socket.as_deref(),
+        snapshot_dir: config.snapshot_dir.as_deref(),
         dns_filter_enabled: config
             .dns_filter_hosts
             .as_ref()

@@ -667,6 +667,8 @@ impl RunCmd {
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             packed_layers_dir: None,
             extra_disks: Vec::new(),
+            control_socket: None,
+            snapshot_dir: None,
         };
 
         let freshly_started = manager

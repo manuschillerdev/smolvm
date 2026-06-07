@@ -164,6 +164,10 @@ pub struct LaunchFeatures {
     /// Additional disk images to attach to the VM (path, read_only).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool)>,
+    /// Control socket for checkpoint/restore/fork operations.
+    pub control_socket: Option<std::path::PathBuf>,
+    /// Snapshot directory to restore from when booting a fork clone.
+    pub snapshot_dir: Option<std::path::PathBuf>,
 }
 
 impl LaunchFeatures {
@@ -262,6 +266,10 @@ pub struct LaunchConfig<'a> {
     pub packed_layers_dir: Option<&'a Path>,
     /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool)],
+    /// Control socket for checkpoint/restore/fork operations.
+    pub control_socket: Option<&'a Path>,
+    /// Snapshot directory to restore from when booting a fork clone.
+    pub snapshot_dir: Option<&'a Path>,
     /// Whether DNS filtering was configured for this launch, even if the
     /// host-side proxy socket could not be created.
     pub dns_filter_enabled: bool,
@@ -303,6 +311,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         dns_filter_socket,
         packed_layers_dir,
         extra_disks,
+        control_socket,
+        snapshot_dir,
         dns_filter_enabled,
         egress_refresh_hosts,
     } = config;
@@ -771,50 +781,43 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         }
 
         // Register a control socket (pause/resume/checkpoint/restore) when
-        // requested via SMOLVM_CONTROL_SOCKET. Best-effort: a missing symbol
-        // (older libkrun) or a failure just leaves the VM without a control
-        // channel rather than aborting the boot.
-        if let Ok(ctl_path) = std::env::var("SMOLVM_CONTROL_SOCKET") {
-            if !ctl_path.is_empty() {
-                match krun.set_control_socket {
-                    Some(set_control_socket) => match CString::new(ctl_path.clone()) {
-                        Ok(ctl_c) => {
-                            let ret = set_control_socket(ctx, ctl_c.as_ptr());
-                            if ret < 0 {
-                                tracing::warn!("krun_set_control_socket failed: {ret}");
-                            } else {
-                                tracing::info!(socket = %ctl_path, "control socket enabled");
-                            }
+        // requested. Best-effort: a missing symbol (older libkrun) or a failure
+        // just leaves the VM without a control channel rather than aborting boot.
+        if let Some(ctl_path) = control_socket {
+            match krun.set_control_socket {
+                Some(set_control_socket) => match path_to_cstring(ctl_path) {
+                    Ok(ctl_c) => {
+                        let ret = set_control_socket(ctx, ctl_c.as_ptr());
+                        if ret < 0 {
+                            tracing::warn!("krun_set_control_socket failed: {ret}");
+                        } else {
+                            tracing::info!(socket = %ctl_path.display(), "control socket enabled");
                         }
-                        Err(_) => tracing::warn!("control socket path contains null byte"),
-                    },
-                    None => tracing::warn!(
-                        "SMOLVM_CONTROL_SOCKET set but libkrun lacks krun_set_control_socket"
-                    ),
-                }
+                    }
+                    Err(_) => tracing::warn!("control socket path contains null byte"),
+                },
+                None => tracing::warn!(
+                    "control socket requested but libkrun lacks krun_set_control_socket"
+                ),
             }
         }
 
         // Fork clone: boot from a snapshot dir (CoW-map a golden VM's RAM +
-        // restore state) instead of cold-booting, when SMOLVM_SNAPSHOT_DIR is set.
-        if let Ok(snap_dir) = std::env::var("SMOLVM_SNAPSHOT_DIR") {
-            if !snap_dir.is_empty() {
-                match krun.set_snapshot {
-                    Some(set_snapshot) => match CString::new(snap_dir.clone()) {
-                        Ok(dir_c) => {
-                            let ret = set_snapshot(ctx, dir_c.as_ptr());
-                            if ret < 0 {
-                                tracing::error!("krun_set_snapshot failed: {ret}");
-                            } else {
-                                tracing::info!(dir = %snap_dir, "booting as fork clone from snapshot");
-                            }
+        // restore state) instead of cold-booting.
+        if let Some(snap_dir) = snapshot_dir {
+            match krun.set_snapshot {
+                Some(set_snapshot) => match path_to_cstring(snap_dir) {
+                    Ok(dir_c) => {
+                        let ret = set_snapshot(ctx, dir_c.as_ptr());
+                        if ret < 0 {
+                            tracing::error!("krun_set_snapshot failed: {ret}");
+                        } else {
+                            tracing::info!(dir = %snap_dir.display(), "booting as fork clone from snapshot");
                         }
-                        Err(_) => tracing::warn!("snapshot dir contains null byte"),
-                    },
-                    None => tracing::warn!(
-                        "SMOLVM_SNAPSHOT_DIR set but libkrun lacks krun_set_snapshot"
-                    ),
-                }
+                    }
+                    Err(_) => tracing::warn!("snapshot dir contains null byte"),
+                },
+                None => tracing::warn!("snapshot requested but libkrun lacks krun_set_snapshot"),
             }
         }
 

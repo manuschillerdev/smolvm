@@ -63,6 +63,8 @@
 
 pub mod agent;
 pub mod api;
+/// Boot subprocess entrypoint for binaries embedding smolvm as a crate.
+pub mod boot;
 pub mod config;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;

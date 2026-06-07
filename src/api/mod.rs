@@ -30,7 +30,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put, MethodRouter},
     Router,
 };
 use std::sync::Arc;
@@ -44,6 +44,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use self::error::ApiError;
+use crate::machine::MachineOperation;
 use state::ApiState;
 
 /// OpenAPI documentation for the smolvm API.
@@ -73,6 +74,7 @@ use state::ApiState;
         handlers::exec::exec_command,
         handlers::exec::exec_stream,
         handlers::exec::run_command,
+        handlers::exec::run_session,
         handlers::exec::stream_logs,
         // Files
         handlers::files::upload_file,
@@ -80,30 +82,42 @@ use state::ApiState;
         // Images
         handlers::images::list_images,
         handlers::images::pull_image,
+        handlers::images::prune_images,
+        handlers::images::storage_status,
         // Machines
         handlers::machines::create_machine,
         handlers::machines::list_machines,
         handlers::machines::get_machine,
         handlers::machines::start_machine,
+        handlers::machines::fork_machine,
         handlers::machines::stop_machine,
         handlers::machines::delete_machine,
-        handlers::machines::exec_machine,
+        handlers::machines::update_machine,
         handlers::machines::resize_machine,
+        handlers::machines::monitor_machine,
+        handlers::machines::network_test,
+        handlers::machines::data_dir,
     ),
     components(schemas(
         // Request types
         types::CreateMachineRequest,
+        types::StartMachineRequest,
+        types::ForkMachineRequest,
+        types::UpdateMachineRequest,
         types::RestartSpec,
         types::MountSpec,
         types::PortSpec,
         types::ResourceSpec,
         types::ExecRequest,
         types::RunRequest,
+        types::MachineRunRequest,
         types::EnvVar,
         types::PullImageRequest,
+        types::PruneImagesRequest,
+        types::NetworkTestRequest,
+        types::MonitorQuery,
         types::DeleteQuery,
         types::LogsQuery,
-        types::MachineExecRequest,
         types::ResizeMachineRequest,
         // Response types
         types::HealthResponse,
@@ -115,6 +129,11 @@ use state::ApiState;
         types::ImageInfo,
         types::ListImagesResponse,
         types::PullImageResponse,
+        types::PruneImagesResponse,
+        types::StorageStatusResponse,
+        types::NetworkTestResponse,
+        types::DataDirResponse,
+        types::MachineRunResponse,
         types::StartResponse,
         types::StopResponse,
         types::DeleteResponse,
@@ -137,6 +156,173 @@ pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpRouteGroup {
+    Timed,
+    LongLived,
+}
+
+enum HttpOperationBinding {
+    Route {
+        group: HttpRouteGroup,
+        path: &'static str,
+    },
+    CoveredBy {
+        operation: MachineOperation,
+    },
+}
+
+fn machine_operation_http_binding(operation: MachineOperation) -> HttpOperationBinding {
+    match operation {
+        MachineOperation::Create => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/",
+        },
+        MachineOperation::Status => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}",
+        },
+        MachineOperation::List => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/",
+        },
+        MachineOperation::Start => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/start",
+        },
+        MachineOperation::Stop => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/stop",
+        },
+        MachineOperation::Delete => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}",
+        },
+        MachineOperation::Fork => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/fork",
+        },
+        MachineOperation::Update => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}",
+        },
+        MachineOperation::Exec => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/exec",
+        },
+        MachineOperation::ExecStream => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/exec/stream",
+        },
+        MachineOperation::ExecInteractive => HttpOperationBinding::Route {
+            group: HttpRouteGroup::LongLived,
+            path: "/{id}/exec/interactive",
+        },
+        MachineOperation::Run => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/run",
+        },
+        MachineOperation::RunSession => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/run",
+        },
+        MachineOperation::Monitor => HttpOperationBinding::Route {
+            group: HttpRouteGroup::LongLived,
+            path: "/{id}/monitor",
+        },
+        MachineOperation::WriteFile => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/files/{*path}",
+        },
+        MachineOperation::UploadFile => HttpOperationBinding::CoveredBy {
+            operation: MachineOperation::WriteFile,
+        },
+        MachineOperation::ReadFile => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/files/{*path}",
+        },
+        MachineOperation::DownloadFile => HttpOperationBinding::CoveredBy {
+            operation: MachineOperation::ReadFile,
+        },
+        MachineOperation::StorageStatus => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/storage",
+        },
+        MachineOperation::ListImages => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/images",
+        },
+        MachineOperation::PullImage => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/images/pull",
+        },
+        MachineOperation::PruneImages => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/images/prune",
+        },
+        MachineOperation::NetworkTest => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/network-test",
+        },
+        MachineOperation::DataDir => HttpOperationBinding::Route {
+            group: HttpRouteGroup::Timed,
+            path: "/{id}/data-dir",
+        },
+    }
+}
+
+fn machine_operation_method_router(
+    operation: MachineOperation,
+) -> Option<MethodRouter<Arc<ApiState>>> {
+    match operation {
+        MachineOperation::Create => Some(post(handlers::machines::create_machine)),
+        MachineOperation::Status => Some(get(handlers::machines::get_machine)),
+        MachineOperation::List => Some(get(handlers::machines::list_machines)),
+        MachineOperation::Start => Some(post(handlers::machines::start_machine)),
+        MachineOperation::Stop => Some(post(handlers::machines::stop_machine)),
+        MachineOperation::Delete => Some(delete(handlers::machines::delete_machine)),
+        MachineOperation::Fork => Some(post(handlers::machines::fork_machine)),
+        MachineOperation::Update => Some(patch(handlers::machines::update_machine)),
+        MachineOperation::Exec => Some(post(handlers::exec::exec_command)),
+        MachineOperation::ExecStream => Some(post(handlers::exec::exec_stream)),
+        MachineOperation::ExecInteractive => Some(get(handlers::exec::exec_interactive)),
+        MachineOperation::Run => Some(post(handlers::exec::run_command)),
+        MachineOperation::RunSession => Some(post(handlers::exec::run_session)),
+        MachineOperation::Monitor => Some(get(handlers::machines::monitor_machine)),
+        MachineOperation::WriteFile => Some(put(handlers::files::upload_file)),
+        MachineOperation::UploadFile => None,
+        MachineOperation::ReadFile => Some(get(handlers::files::download_file)),
+        MachineOperation::DownloadFile => None,
+        MachineOperation::StorageStatus => Some(get(handlers::images::storage_status)),
+        MachineOperation::ListImages => Some(get(handlers::images::list_images)),
+        MachineOperation::PullImage => Some(post(handlers::images::pull_image)),
+        MachineOperation::PruneImages => Some(post(handlers::images::prune_images)),
+        MachineOperation::NetworkTest => Some(post(handlers::machines::network_test)),
+        MachineOperation::DataDir => Some(get(handlers::machines::data_dir)),
+    }
+}
+
+fn machine_operation_routes(group: HttpRouteGroup) -> Router<Arc<ApiState>> {
+    let mut router = Router::new();
+    for operation in MachineOperation::ALL {
+        match machine_operation_http_binding(*operation) {
+            HttpOperationBinding::Route {
+                group: route_group,
+                path,
+            } if route_group == group => {
+                let method_router = machine_operation_method_router(*operation)
+                    .expect("routed machine operation must have a method router");
+                router = router.route(path, method_router);
+            }
+            HttpOperationBinding::Route { .. } => {}
+            HttpOperationBinding::CoveredBy { operation } => {
+                let _ = operation.method_name();
+            }
+        }
+    }
+    router
+}
+
 /// Create the API router with all endpoints.
 ///
 /// `cors_origins` specifies allowed CORS origins. If empty, defaults to
@@ -148,35 +334,15 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Node capacity introspection (polled by a fleet node-agent over HTTP).
     let capacity_route = Router::new().route("/capacity", get(handlers::node::capacity));
 
-    // Long-lived streaming routes (no request timeout): SSE logs and the
-    // interactive PTY WebSocket both outlive the 5-minute API timeout.
-    let logs_route = Router::new()
-        .route("/{id}/logs", get(handlers::exec::stream_logs))
-        .route(
-            "/{id}/exec/interactive",
-            get(handlers::exec::exec_interactive),
-        );
+    // Long-lived streaming routes (no request timeout): logs, monitor SSE,
+    // and the interactive PTY WebSocket can outlive the 5-minute API timeout.
+    let logs_route = Router::new().route("/{id}/logs", get(handlers::exec::stream_logs));
+    let long_lived_machine_routes = machine_operation_routes(HttpRouteGroup::LongLived);
 
-    // Machine routes with timeout
-    let machine_routes_with_timeout = Router::new()
-        .route("/", post(handlers::machines::create_machine))
-        .route("/", get(handlers::machines::list_machines))
-        .route("/{id}", get(handlers::machines::get_machine))
-        .route("/{id}/start", post(handlers::machines::start_machine))
-        .route("/{id}/stop", post(handlers::machines::stop_machine))
-        .route("/{id}", delete(handlers::machines::delete_machine))
-        // Exec routes
-        .route("/{id}/exec", post(handlers::exec::exec_command))
-        .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
-        .route("/{id}/run", post(handlers::exec::run_command))
-        // File I/O routes
-        .route("/{id}/files/{*path}", put(handlers::files::upload_file))
-        .route("/{id}/files/{*path}", get(handlers::files::download_file))
-        // Image routes
-        .route("/{id}/images", get(handlers::images::list_images))
-        .route("/{id}/images/pull", post(handlers::images::pull_image))
-        // Apply timeout only to these routes
-        .layer(TimeoutLayer::with_status_code(
+    // Machine routes with timeout. Built from the machine operation catalog so
+    // adding a service operation forces an HTTP route/coverage decision.
+    let machine_routes_with_timeout =
+        machine_operation_routes(HttpRouteGroup::Timed).layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
         ));
@@ -184,6 +350,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Machine routes
     let machine_routes = Router::new()
         .merge(logs_route)
+        .merge(long_lived_machine_routes)
         .merge(machine_routes_with_timeout);
 
     // API v1 routes
@@ -327,5 +494,28 @@ mod tests {
         assert!(validate_command(&[]).is_err());
         assert!(validate_command(&["echo".to_string()]).is_ok());
         assert!(validate_command(&["echo".to_string(), "hello".to_string()]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod operation_route_tests {
+    use super::*;
+
+    #[test]
+    fn machine_operation_routes_build_for_all_groups() {
+        let _ = machine_operation_routes(HttpRouteGroup::Timed);
+        let _ = machine_operation_routes(HttpRouteGroup::LongLived);
+    }
+
+    #[test]
+    fn covered_operations_reference_known_operations() {
+        for operation in MachineOperation::ALL {
+            if let HttpOperationBinding::CoveredBy {
+                operation: covered_by,
+            } = machine_operation_http_binding(*operation)
+            {
+                assert!(MachineOperation::ALL.contains(&covered_by));
+            }
+        }
     }
 }

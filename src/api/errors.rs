@@ -75,6 +75,9 @@ impl From<crate::error::Error> for ApiError {
                 "invalid state: expected {}, got {}",
                 expected, actual
             )),
+            crate::error::Error::Config { operation, reason } => {
+                ApiError::BadRequest(format!("{}: {}", operation, reason))
+            }
             // Handle structured Agent errors using kind for HTTP status mapping
             crate::error::Error::Agent { reason, kind, .. } => match kind {
                 crate::error::AgentErrorKind::NotFound => ApiError::NotFound(reason.clone()),
